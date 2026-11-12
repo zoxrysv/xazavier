@@ -295,7 +295,7 @@ func TestLogIntegrityRules(t *testing.T) {
 		t.Fatalf("delete log: %v", err)
 	}
 
-	allAudits, err := svc.ListAudit(ctx)
+	allAudits, err := svc.ListAudit(ctx, domain.AuditListFilter{})
 	if err != nil {
 		t.Fatalf("list all audits: %v", err)
 	}
@@ -310,3 +310,4 @@ func TestLogIntegrityRules(t *testing.T) {
 		t.Fatal("expected DELETE audit record to be preserved after log deletion")
 	}
 }
+

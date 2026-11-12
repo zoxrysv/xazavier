@@ -109,6 +109,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS logs_integrity_trigger ON logs;
 CREATE TRIGGER logs_integrity_trigger
 BEFORE INSERT OR UPDATE ON logs
 FOR EACH ROW
@@ -124,6 +125,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS logs_delete_guard ON logs;
 CREATE TRIGGER logs_delete_guard
 BEFORE DELETE ON logs
 FOR EACH ROW

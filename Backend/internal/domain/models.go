@@ -156,3 +156,15 @@ type TokenBundle struct {
 	RefreshToken string     `json:"refresh_token,omitempty"`
 	User         UserPublic `json:"user"`
 }
+
+type LogListFilter struct {
+	Limit    int    `json:"limit,omitempty"`
+	Offset   int    `json:"offset,omitempty"`
+	FromDate string `json:"from_date,omitempty"`
+	ToDate   string `json:"to_date,omitempty"`
+}
+
+type AuditListFilter struct {
+	Limit  int `json:"limit,omitempty"`
+	Offset int `json:"offset,omitempty"`
+}

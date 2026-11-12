@@ -1,4 +1,4 @@
-﻿package httpapi
+package httpapi
 
 import (
     "context"
@@ -7,6 +7,7 @@ import (
     "fmt"
     "log/slog"
     "net/http"
+    "strconv"
     "strings"
     "sync"
     "time"
@@ -49,6 +50,7 @@ func NewServer(cfg config.Config, store repository.Store) http.Handler {
             if err := decodeJSON(r, &body); err != nil { writeError(w, err); return }
             bundle, err := svc.Register(r.Context(), body, clientIP(r))
             if err != nil { writeError(w, err); return }
+            setRefreshTokenCookie(w, bundle.RefreshToken, cfg)
             writeJSON(w, http.StatusCreated, bundle)
         }))
         r.Post("/auth/login", limit(limiter, func(w http.ResponseWriter, r *http.Request) {
@@ -56,19 +58,30 @@ func NewServer(cfg config.Config, store repository.Store) http.Handler {
             if err := decodeJSON(r, &body); err != nil { writeError(w, err); return }
             bundle, err := svc.Login(r.Context(), body, clientIP(r))
             if err != nil { writeError(w, err); return }
+            setRefreshTokenCookie(w, bundle.RefreshToken, cfg)
             writeJSON(w, http.StatusOK, bundle)
         }))
         r.Post("/auth/refresh", func(w http.ResponseWriter, r *http.Request) {
             var body domain.AuthRefreshRequest
-            if err := decodeJSON(r, &body); err != nil { writeError(w, err); return }
+            _ = decodeJSON(r, &body)
+            if cookie, err := r.Cookie("refresh_token"); err == nil && cookie.Value != "" {
+                body.RefreshToken = cookie.Value
+            }
             bundle, err := svc.Refresh(r.Context(), body, clientIP(r))
             if err != nil { writeError(w, err); return }
+            if bundle.RefreshToken != "" {
+                setRefreshTokenCookie(w, bundle.RefreshToken, cfg)
+            }
             writeJSON(w, http.StatusOK, bundle)
         })
         r.Post("/auth/logout", func(w http.ResponseWriter, r *http.Request) {
             var body domain.AuthLogoutRequest
-            if err := decodeJSON(r, &body); err != nil { writeError(w, err); return }
+            _ = decodeJSON(r, &body)
+            if cookie, err := r.Cookie("refresh_token"); err == nil && cookie.Value != "" {
+                body.RefreshToken = cookie.Value
+            }
             if err := svc.Logout(r.Context(), body); err != nil { writeError(w, err); return }
+            clearRefreshTokenCookie(w, cfg)
             writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
         })
 
@@ -130,7 +143,13 @@ func NewServer(cfg config.Config, store repository.Store) http.Handler {
         })
 
         r.With(requireAuth(svc)).Get("/logs", func(w http.ResponseWriter, r *http.Request) {
-            items, err := svc.ListLogs(r.Context())
+            filter := domain.LogListFilter{
+                Limit:    queryInt(r, "limit", 0),
+                Offset:   queryInt(r, "offset", 0),
+                FromDate: r.URL.Query().Get("from"),
+                ToDate:   r.URL.Query().Get("to"),
+            }
+            items, err := svc.ListLogs(r.Context(), filter)
             if err != nil { writeError(w, err); return }
             writeJSON(w, http.StatusOK, items)
         })
@@ -167,7 +186,11 @@ func NewServer(cfg config.Config, store repository.Store) http.Handler {
             writeJSON(w, http.StatusOK, items)
         })
         r.With(requireAuth(svc)).Get("/audit", func(w http.ResponseWriter, r *http.Request) {
-            items, err := svc.ListAudit(r.Context())
+            filter := domain.AuditListFilter{
+                Limit:  queryInt(r, "limit", 0),
+                Offset: queryInt(r, "offset", 0),
+            }
+            items, err := svc.ListAudit(r.Context(), filter)
             if err != nil { writeError(w, err); return }
             writeJSON(w, http.StatusOK, items)
         })
@@ -248,6 +271,38 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
     if err := json.NewEncoder(w).Encode(v); err != nil {
         slog.Warn("json encode failed", "err", err)
     }
+}
+
+func queryInt(r *http.Request, key string, def int) int {
+    if v := r.URL.Query().Get(key); v != "" {
+        if i, err := strconv.Atoi(v); err == nil {
+            return i
+        }
+    }
+    return def
+}
+
+func setRefreshTokenCookie(w http.ResponseWriter, token string, cfg config.Config) {
+    http.SetCookie(w, &http.Cookie{
+        Name:     "refresh_token",
+        Value:    token,
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   cfg.CookieSecure,
+        SameSite: http.SameSiteStrictMode,
+    })
+}
+
+func clearRefreshTokenCookie(w http.ResponseWriter, cfg config.Config) {
+    http.SetCookie(w, &http.Cookie{
+        Name:     "refresh_token",
+        Value:    "",
+        Path:     "/",
+        HttpOnly: true,
+        Secure:   cfg.CookieSecure,
+        MaxAge:   -1,
+        SameSite: http.SameSiteStrictMode,
+    })
 }
 
 func writeError(w http.ResponseWriter, err error) {

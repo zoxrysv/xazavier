@@ -9,13 +9,12 @@ import (
 	"strings"
 	"time"
 
-	"xazavier/internal/apperr"
-	"xazavier/internal/domain"
-	"xazavier/migrations"
-
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"xazavier/internal/apperr"
+	"xazavier/internal/domain"
+	"xazavier/migrations"
 )
 
 // Store is the repository contract used by the service layer.
@@ -39,12 +38,12 @@ type Store interface {
 	AddActivity(activity domain.Activity) error
 	UpdateActivity(activity domain.Activity) error
 	DeleteActivity(userID, id string) error
-	ListLogs(userID string) []domain.Log
+	ListLogs(userID string, filter domain.LogListFilter) []domain.Log
 	GetLogByID(userID, id string) (domain.Log, bool)
 	AddLog(log domain.Log) error
 	UpdateLog(log domain.Log) error
 	DeleteLog(userID, id string) error
-	ListAudit(userID string) []domain.Audit
+	ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit
 	AddAudit(audit domain.Audit) error
 	ListAuditForLog(userID, logID string) []domain.Audit
 	ResetUserData(userID string) error
@@ -121,6 +120,33 @@ func AutoMigrate(ctx context.Context, databaseURL string) error {
 	}
 	defer store.Close()
 
+	// Ensure migration tracking table exists.
+	_, err = store.pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	// Load already-applied versions.
+	rows, err := store.pool.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("query schema_migrations: %w", err)
+	}
+	applied := make(map[string]bool)
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[v] = true
+	}
+	rows.Close()
+
 	entries, err := migrations.FS.ReadDir(".")
 	if err != nil {
 		return err
@@ -134,12 +160,18 @@ func AutoMigrate(ctx context.Context, databaseURL string) error {
 	}
 	sort.Strings(files)
 	for _, name := range files {
+		if applied[name] {
+			continue // already applied, skip
+		}
 		content, err := migrations.FS.ReadFile(name)
 		if err != nil {
 			return err
 		}
 		if _, err := store.pool.Exec(ctx, string(content)); err != nil {
 			return fmt.Errorf("migrate %s: %w", name, err)
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, name); err != nil {
+			return fmt.Errorf("record migration %s: %w", name, err)
 		}
 	}
 	return nil
@@ -248,79 +280,34 @@ func (s *PostgresStore) ListSessionsForUser(userID string) []domain.Session {
 }
 
 func (s *PostgresStore) ListClusters(userID string) []domain.Cluster {
-	rows, err := s.pool.Query(context.Background(), `
-        SELECT
-            id,
-            user_id,
-            name,
-            COALESCE(icon, ''),
-            COALESCE(color, ''),
-            deleted_at,
-            created_at
-        FROM clusters
-        WHERE user_id = $1
-        ORDER BY created_at ASC
-    `, userID)
-
+	rows, err := s.pool.Query(context.Background(), `SELECT id,user_id,name,icon,color,deleted_at,created_at FROM clusters WHERE user_id = $1 ORDER BY created_at ASC`, userID)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
-
 	out := make([]domain.Cluster, 0)
-
 	for rows.Next() {
 		var cluster domain.Cluster
 		var deletedAt *time.Time
-
-		if err := rows.Scan(
-			&cluster.ID,
-			&cluster.UserID,
-			&cluster.Name,
-			&cluster.Icon,
-			&cluster.Color,
-			&deletedAt,
-			&cluster.CreatedAt,
-		); err != nil {
+		if err := rows.Scan(&cluster.ID, &cluster.UserID, &cluster.Name, &cluster.Icon, &cluster.Color, &deletedAt, &cluster.CreatedAt); err != nil {
 			continue
 		}
-
 		cluster.DeletedAt = deletedAt
 		out = append(out, cluster)
 	}
-
 	return out
 }
 
 func (s *PostgresStore) GetClusterByID(userID, id string) (domain.Cluster, bool) {
-	row := s.pool.QueryRow(context.Background(), `
-        SELECT
-            id,
-            user_id,
-            name,
-            COALESCE(icon, ''),
-            COALESCE(color, ''),
-            deleted_at,
-            created_at
-        FROM clusters
-        WHERE user_id = $1 AND id = $2
-    `, userID, id)
-
+	row := s.pool.QueryRow(context.Background(), `SELECT id,user_id,name,icon,color,deleted_at,created_at FROM clusters WHERE user_id = $1 AND id = $2`, userID, id)
 	var cluster domain.Cluster
 	var deletedAt *time.Time
-
-	if err := row.Scan(
-		&cluster.ID,
-		&cluster.UserID,
-		&cluster.Name,
-		&cluster.Icon,
-		&cluster.Color,
-		&deletedAt,
-		&cluster.CreatedAt,
-	); err != nil {
+	if err := row.Scan(&cluster.ID, &cluster.UserID, &cluster.Name, &cluster.Icon, &cluster.Color, &deletedAt, &cluster.CreatedAt); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Cluster{}, false
+		}
 		return domain.Cluster{}, false
 	}
-
 	cluster.DeletedAt = deletedAt
 	return cluster, true
 }
@@ -400,8 +387,36 @@ func (s *PostgresStore) DeleteActivity(userID, id string) error {
 	return mapDBError(err, "Activity not deleted", "The selected activity could not be deleted.")
 }
 
-func (s *PostgresStore) ListLogs(userID string) []domain.Log {
-	rows, err := s.pool.Query(context.Background(), `SELECT id,activity_id,user_id,log_date::text,start_time,end_time,logged_value,entry_status,status,notes,created_at,updated_at,edited FROM logs WHERE user_id = $1 ORDER BY start_time ASC`, userID)
+func (s *PostgresStore) ListLogs(userID string, filter domain.LogListFilter) []domain.Log {
+	query := `SELECT id,activity_id,user_id,log_date::text,start_time,end_time,logged_value,entry_status,status,notes,created_at,updated_at,edited FROM logs WHERE user_id = $1`
+	args := []any{userID}
+	argIdx := 2
+
+	if filter.FromDate != "" {
+		query += fmt.Sprintf(` AND log_date >= $%d`, argIdx)
+		args = append(args, filter.FromDate)
+		argIdx++
+	}
+	if filter.ToDate != "" {
+		query += fmt.Sprintf(` AND log_date <= $%d`, argIdx)
+		args = append(args, filter.ToDate)
+		argIdx++
+	}
+
+	query += ` ORDER BY start_time ASC`
+
+	if filter.Limit > 0 {
+		query += fmt.Sprintf(` LIMIT $%d`, argIdx)
+		args = append(args, filter.Limit)
+		argIdx++
+		if filter.Offset > 0 {
+			query += fmt.Sprintf(` OFFSET $%d`, argIdx)
+			args = append(args, filter.Offset)
+			argIdx++
+		}
+	}
+
+	rows, err := s.pool.Query(context.Background(), query, args...)
 	if err != nil {
 		return nil
 	}
@@ -459,8 +474,23 @@ func (s *PostgresStore) DeleteLog(userID, id string) error {
 	return mapDBError(err, "Delete rejected", "This record could not be deleted.")
 }
 
-func (s *PostgresStore) ListAudit(userID string) []domain.Audit {
-	rows, err := s.pool.Query(context.Background(), `SELECT id,user_id,log_id,action_type,old_start_time,old_end_time,old_logged_value,changed_at FROM audit WHERE user_id = $1 ORDER BY changed_at ASC`, userID)
+func (s *PostgresStore) ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit {
+	query := `SELECT id,user_id,log_id,action_type,old_start_time,old_end_time,old_logged_value,changed_at FROM audit WHERE user_id = $1 ORDER BY changed_at ASC`
+	args := []any{userID}
+	argIdx := 2
+
+	if filter.Limit > 0 {
+		query += fmt.Sprintf(` LIMIT $%d`, argIdx)
+		args = append(args, filter.Limit)
+		argIdx++
+		if filter.Offset > 0 {
+			query += fmt.Sprintf(` OFFSET $%d`, argIdx)
+			args = append(args, filter.Offset)
+			argIdx++
+		}
+	}
+
+	rows, err := s.pool.Query(context.Background(), query, args...)
 	if err != nil {
 		return nil
 	}

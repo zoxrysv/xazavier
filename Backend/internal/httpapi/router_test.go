@@ -239,3 +239,4 @@ func TestResetAPI(t *testing.T) {
 		t.Fatalf("expected 0 logs after reset, got %d", len(logs))
 	}
 }
+

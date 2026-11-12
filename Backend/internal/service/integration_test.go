@@ -11,11 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"xazavier/internal/config"
 	"xazavier/internal/domain"
 	"xazavier/internal/repository"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 var (
@@ -252,7 +253,10 @@ func TestIntegrationCreateAndListLogs(t *testing.T) {
 		t.Fatal("expected stored count value")
 	}
 
-	logs, err := svc.ListLogs(ctx)
+	logs, err := svc.ListLogs(ctx, domain.LogListFilter{
+		FromDate: start.Format(time.RFC3339),
+		ToDate:   time.Now().Format(time.RFC3339),
+	})
 	if err != nil {
 		t.Fatalf("list logs: %v", err)
 	}
@@ -542,7 +546,7 @@ func TestIntegrationResetUserData(t *testing.T) {
 	if err := svc.Reset(ctx); err != nil {
 		t.Fatalf("reset user data: %v", err)
 	}
-	if logs, err := svc.ListLogs(ctx); err != nil || len(logs) != 0 {
+	if logs, err := svc.ListLogs(ctx, domain.LogListFilter{}); err != nil || len(logs) != 0 {
 		t.Fatalf("logs should be cleared after reset, got len=%d err=%v", len(logs), err)
 	}
 }

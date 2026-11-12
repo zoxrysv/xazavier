@@ -18,6 +18,7 @@ type Config struct {
 	AutoMigrate         bool
 	LogLevel           string
 	TrustedProxy       string
+	CookieSecure       bool
 }
 
 func Load() Config {
@@ -32,6 +33,7 @@ func Load() Config {
 		AutoMigrate:     envBool("AUTO_MIGRATE", true),
 		LogLevel:        env("LOG_LEVEL", "info"),
 		TrustedProxy:    env("TRUSTED_PROXY", ""),
+		CookieSecure:    envBool("COOKIE_SECURE", false),
 	}
 	return cfg
 }

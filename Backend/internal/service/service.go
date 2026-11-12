@@ -261,12 +261,12 @@ func (s *Service) DeleteActivity(ctx context.Context, id string) error {
 	return s.store.DeleteActivity(user.ID, id)
 }
 
-func (s *Service) ListLogs(ctx context.Context) ([]domain.Log, error) {
+func (s *Service) ListLogs(ctx context.Context, filter domain.LogListFilter) ([]domain.Log, error) {
 	user, ok := currentUser(ctx)
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	logs := s.store.ListLogs(user.ID)
+	logs := s.store.ListLogs(user.ID, filter)
 	for i := range logs {
 		logs[i].Status = strings.ToLower(logs[i].EntryStatus)
 	}
@@ -440,12 +440,12 @@ func (s *Service) ListAuditForLog(ctx context.Context, logID string) ([]domain.A
 	return s.store.ListAuditForLog(user.ID, logID), nil
 }
 
-func (s *Service) ListAudit(ctx context.Context) ([]domain.Audit, error) {
+func (s *Service) ListAudit(ctx context.Context, filter domain.AuditListFilter) ([]domain.Audit, error) {
 	user, ok := currentUser(ctx)
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	return s.store.ListAudit(user.ID), nil
+	return s.store.ListAudit(user.ID, filter), nil
 }
 
 func (s *Service) Reset(ctx context.Context) error {

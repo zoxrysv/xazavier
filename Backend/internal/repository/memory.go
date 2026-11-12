@@ -298,19 +298,37 @@ func (m *MemStore) DeleteActivity(userID, id string) error {
 
 // Log methods
 
-func (m *MemStore) ListLogs(userID string) []domain.Log {
+func (m *MemStore) ListLogs(userID string, filter domain.LogListFilter) []domain.Log {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	out := make([]domain.Log, 0)
 	for _, l := range m.logs {
-		if l.UserID == userID {
-			out = append(out, l)
+		if l.UserID != userID {
+			continue
 		}
+		if filter.FromDate != "" && l.LogDate < filter.FromDate {
+			continue
+		}
+		if filter.ToDate != "" && l.LogDate > filter.ToDate {
+			continue
+		}
+		out = append(out, l)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].StartTime.Before(out[j].StartTime)
 	})
+
+	if filter.Offset > 0 {
+		if filter.Offset >= len(out) {
+			return []domain.Log{}
+		}
+		out = out[filter.Offset:]
+	}
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+
 	return out
 }
 
@@ -359,7 +377,7 @@ func (m *MemStore) DeleteLog(userID, id string) error {
 
 // Audit methods
 
-func (m *MemStore) ListAudit(userID string) []domain.Audit {
+func (m *MemStore) ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -372,6 +390,17 @@ func (m *MemStore) ListAudit(userID string) []domain.Audit {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].ChangedAt.Before(out[j].ChangedAt)
 	})
+
+	if filter.Offset > 0 {
+		if filter.Offset >= len(out) {
+			return []domain.Audit{}
+		}
+		out = out[filter.Offset:]
+	}
+	if filter.Limit > 0 && len(out) > filter.Limit {
+		out = out[:filter.Limit]
+	}
+
 	return out
 }
 
@@ -590,3 +619,4 @@ func SeedMemoryStore(store Store) {
 		_ = store.UpdateLog(codingLog)
 	}
 }
+
