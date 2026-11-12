@@ -400,14 +400,13 @@ func (s *Service) UpdateLog(ctx context.Context, id string, req domain.LogUpdate
 	}
 	log.UpdatedAt = now
 	log.Status = strings.ToLower(log.EntryStatus)
+	var auditPtr *domain.Audit
 	if oldStart != log.StartTime || !sameTimePtr(oldEnd, log.EndTime) || !sameFloatPtr(oldValue, log.LoggedValue) {
 		audit := domain.Audit{ID: uuid.NewString(), UserID: user.ID, LogID: log.ID, ActionType: "UPDATE", OldStartTime: &oldStart, OldEndTime: oldEnd, OldLoggedValue: oldValue, ChangedAt: now}
-		if err := s.store.AddAudit(audit); err != nil {
-			return domain.Log{}, err
-		}
+		auditPtr = &audit
 		log.Edited = log.Edited + 1
 	}
-	if err := s.store.UpdateLog(log); err != nil {
+	if err := s.store.UpdateLogWithAudit(log, auditPtr); err != nil {
 		return domain.Log{}, err
 	}
 	return log, nil
@@ -426,10 +425,7 @@ func (s *Service) DeleteLog(ctx context.Context, id string) error {
 		return apperr.UnprocessableEntity("Delete rejected", "This record started more than 24 hours ago and is locked.\n\nThis restriction protects the integrity of historical data.", "LOCKED_LOG")
 	}
 	audit := domain.Audit{ID: uuid.NewString(), UserID: user.ID, LogID: log.ID, ActionType: "DELETE", OldStartTime: &log.StartTime, OldEndTime: log.EndTime, OldLoggedValue: log.LoggedValue, ChangedAt: time.Now().UTC()}
-	if err := s.store.AddAudit(audit); err != nil {
-		return err
-	}
-	return s.store.DeleteLog(user.ID, id)
+	return s.store.DeleteLogWithAudit(user.ID, id, audit)
 }
 
 func (s *Service) ListAuditForLog(ctx context.Context, logID string) ([]domain.Audit, error) {

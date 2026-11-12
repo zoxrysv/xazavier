@@ -375,6 +375,34 @@ func (m *MemStore) DeleteLog(userID, id string) error {
 	return nil
 }
 
+func (m *MemStore) UpdateLogWithAudit(log domain.Log, audit *domain.Audit) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	l, ok := m.logs[log.ID]
+	if !ok || l.UserID != log.UserID {
+		return apperr.NotFound()
+	}
+	if audit != nil {
+		m.audit = append(m.audit, *audit)
+	}
+	m.logs[log.ID] = log
+	return nil
+}
+
+func (m *MemStore) DeleteLogWithAudit(userID, id string, audit domain.Audit) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	l, ok := m.logs[id]
+	if !ok || l.UserID != userID {
+		return apperr.NotFound()
+	}
+	m.audit = append(m.audit, audit)
+	delete(m.logs, id)
+	return nil
+}
+
 // Audit methods
 
 func (m *MemStore) ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit {

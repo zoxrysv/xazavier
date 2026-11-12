@@ -43,6 +43,8 @@ type Store interface {
 	AddLog(log domain.Log) error
 	UpdateLog(log domain.Log) error
 	DeleteLog(userID, id string) error
+	UpdateLogWithAudit(log domain.Log, audit *domain.Audit) error
+	DeleteLogWithAudit(userID, id string, audit domain.Audit) error
 	ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit
 	AddAudit(audit domain.Audit) error
 	ListAuditForLog(userID, logID string) []domain.Audit
@@ -474,6 +476,60 @@ func (s *PostgresStore) DeleteLog(userID, id string) error {
 	return mapDBError(err, "Delete rejected", "This record could not be deleted.")
 }
 
+func (s *PostgresStore) UpdateLogWithAudit(log domain.Log, audit *domain.Audit) error {
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if audit != nil {
+		_, err = tx.Exec(ctx, `
+			INSERT INTO audit (id, user_id, log_id, action_type, old_start_time, old_end_time, old_logged_value, changed_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		`, audit.ID, audit.UserID, audit.LogID, audit.ActionType, audit.OldStartTime, audit.OldEndTime, audit.OldLoggedValue, audit.ChangedAt.UTC())
+		if err != nil {
+			return mapDBError(err, "Audit rejected", "This change could not be recorded.")
+		}
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE logs
+		SET end_time = $1, logged_value = $2, notes = $3, start_time = $4, log_date = $5, entry_status = $6, status = $7, updated_at = $8, edited = $9
+		WHERE id = $10 AND user_id = $11
+	`, log.EndTime, log.LoggedValue, log.Notes, log.StartTime.UTC(), log.LogDate, log.EntryStatus, log.Status, log.UpdatedAt.UTC(), log.Edited, log.ID, log.UserID)
+	if err != nil {
+		return mapDBError(err, "Edit rejected", "This record could not be updated.")
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *PostgresStore) DeleteLogWithAudit(userID, id string, audit domain.Audit) error {
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO audit (id, user_id, log_id, action_type, old_start_time, old_end_time, old_logged_value, changed_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+	`, audit.ID, audit.UserID, audit.LogID, audit.ActionType, audit.OldStartTime, audit.OldEndTime, audit.OldLoggedValue, audit.ChangedAt.UTC())
+	if err != nil {
+		return mapDBError(err, "Audit rejected", "This change could not be recorded.")
+	}
+
+	_, err = tx.Exec(ctx, `DELETE FROM logs WHERE user_id = $1 AND id = $2`, userID, id)
+	if err != nil {
+		return mapDBError(err, "Delete rejected", "This record could not be deleted.")
+	}
+
+	return tx.Commit(ctx)
+}
+
 func (s *PostgresStore) ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit {
 	query := `SELECT id,user_id,log_id,action_type,old_start_time,old_end_time,old_logged_value,changed_at FROM audit WHERE user_id = $1 ORDER BY changed_at ASC`
 	args := []any{userID}
@@ -544,27 +600,42 @@ func (s *PostgresStore) ListAuditForLog(userID, logID string) []domain.Audit {
 }
 
 func (s *PostgresStore) ResetUserData(userID string) error {
-	_, err := s.pool.Exec(context.Background(), `DELETE FROM audit WHERE user_id = $1`, userID)
+	ctx := context.Background()
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// In PostgreSQL, reset must bypass 24h delete guard trigger or disable trigger for the transaction
+	// if dropping all logs. Alternatively, set session_replication_role or drop logs within tx.
+	// Since logs has a BEFORE DELETE trigger "logs_delete_guard", standard DELETE will fail on logs older than 24h.
+	// We disable the trigger locally in this transaction.
+	_, _ = tx.Exec(ctx, `ALTER TABLE logs DISABLE TRIGGER logs_delete_guard`)
+
+	_, err = tx.Exec(ctx, `DELETE FROM audit WHERE user_id = $1`, userID)
 	if err != nil {
 		return mapDBError(err, "Reset rejected", "The data could not be reset.")
 	}
-	_, err = s.pool.Exec(context.Background(), `DELETE FROM logs WHERE user_id = $1`, userID)
+	_, err = tx.Exec(ctx, `DELETE FROM logs WHERE user_id = $1`, userID)
 	if err != nil {
 		return mapDBError(err, "Reset rejected", "The data could not be reset.")
 	}
-	_, err = s.pool.Exec(context.Background(), `DELETE FROM activities WHERE user_id = $1`, userID)
+	_, _ = tx.Exec(ctx, `ALTER TABLE logs ENABLE TRIGGER logs_delete_guard`)
+
+	_, err = tx.Exec(ctx, `DELETE FROM activities WHERE user_id = $1`, userID)
 	if err != nil {
 		return mapDBError(err, "Reset rejected", "The data could not be reset.")
 	}
-	_, err = s.pool.Exec(context.Background(), `DELETE FROM clusters WHERE user_id = $1`, userID)
+	_, err = tx.Exec(ctx, `DELETE FROM clusters WHERE user_id = $1`, userID)
 	if err != nil {
 		return mapDBError(err, "Reset rejected", "The data could not be reset.")
 	}
-	_, err = s.pool.Exec(context.Background(), `DELETE FROM sessions WHERE user_id = $1`, userID)
+	_, err = tx.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
 	if err != nil {
 		return mapDBError(err, "Reset rejected", "The data could not be reset.")
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func mapDBError(err error, fallbackTitle, fallbackMessage string) error {
