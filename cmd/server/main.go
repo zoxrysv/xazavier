@@ -11,13 +11,15 @@ import (
 	"xazavier/internal/repository"
 )
 
+// Jadi di bawah ini buat ngecek nih panjang length dari token
 func main() {
 	cfg := config.Load()
 	if len(cfg.JWTSecret) < 32 {
 		log.Fatal("JWT_SECRET must be at least 32 characters long")
 	}
-
+	// ini buat milih tempat penyimpanan di ram
 	var store repository.Store
+	//DATABASE_URL = "memory": pakai penyimpanan di RAM. Kalau mode production, ditolak.
 	if cfg.DatabaseURL == "memory" {
 		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "prod") {
 			log.Fatal("DATABASE_URL='memory' is not allowed in production environment")
@@ -26,6 +28,8 @@ func main() {
 		memStore := repository.NewMemoryStore()
 		repository.SeedMemoryStore(memStore)
 		store = memStore
+
+		//DATABASE_URL kosong: sama, pakai RAM (dev saja). Kalau production, ditolak.
 	} else if strings.TrimSpace(cfg.DatabaseURL) == "" {
 		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "prod") {
 			log.Fatal("DATABASE_URL is empty in production: a valid PostgreSQL connection string is required")
@@ -34,6 +38,8 @@ func main() {
 		memStore := repository.NewMemoryStore()
 		repository.SeedMemoryStore(memStore)
 		store = memStore
+
+		//Selain itu (ada URL Postgres): jalankan migrasi (bikin tabel), lalu konek ke Postgres.
 	} else {
 		if cfg.AutoMigrate {
 			if err := repository.AutoMigrate(context.Background(), cfg.DatabaseURL); err != nil {
@@ -48,6 +54,7 @@ func main() {
 		store = pgStore
 	}
 
+	//Bikin server (httpapi.NewServer) dan nyalain di port 8080.
 	r := httpapi.NewServer(cfg, store)
 	log.Printf("API server listening on :%s", cfg.Port)
 	if err := http.ListenAndServe(":"+cfg.Port, r); err != nil {

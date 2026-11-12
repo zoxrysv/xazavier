@@ -35,6 +35,9 @@ func setupTestServer() (http.Handler, string, *repository.MemStore) {
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		panic("test setup login failed: " + w.Body.String())
+	}
 
 	var bundle domain.TokenBundle
 	_ = json.NewDecoder(w.Body).Decode(&bundle)
@@ -239,4 +242,3 @@ func TestResetAPI(t *testing.T) {
 		t.Fatalf("expected 0 logs after reset, got %d", len(logs))
 	}
 }
-

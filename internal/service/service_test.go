@@ -30,8 +30,8 @@ func newTestMemService() (*Service, *repository.MemStore, domain.User, context.C
 	if err != nil {
 		panic(err)
 	}
-	user, _ := store.GetUserByEmail("tester@example.com")
-	ctx := context.WithValue(context.Background(), "user", user)
+	user, _, _ := store.GetUserByEmail("tester@example.com")
+	ctx := context.WithValue(context.Background(), domain.UserContextKey, user)
 	return svc, store, user, ctx
 }
 
@@ -310,4 +310,3 @@ func TestLogIntegrityRules(t *testing.T) {
 		t.Fatal("expected DELETE audit record to be preserved after log deletion")
 	}
 }
-

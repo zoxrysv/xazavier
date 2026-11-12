@@ -36,12 +36,12 @@ func (s *Service) CurrentUser(ctx context.Context) (domain.User, bool) {
 }
 
 func (s *Service) ValidateSession(sessionID string) (domain.User, bool) {
-	session, ok := s.store.GetSessionByID(sessionID)
-	if !ok || session.IsRevoked || time.Now().After(session.ExpiresAt) {
+	session, ok, err := s.store.GetSessionByID(sessionID)
+	if err != nil || !ok || session.IsRevoked || time.Now().After(session.ExpiresAt) {
 		return domain.User{}, false
 	}
-	user, ok := s.store.GetUserByID(session.UserID)
-	if !ok {
+	user, ok, err := s.store.GetUserByID(session.UserID)
+	if err != nil || !ok {
 		return domain.User{}, false
 	}
 	return user, true
@@ -64,7 +64,9 @@ func (s *Service) Register(ctx context.Context, req domain.AuthRegisterRequest, 
 	if _, err := time.LoadLocation(req.Timezone); err != nil {
 		return domain.TokenBundle{}, apperr.InvalidRequest(fmt.Sprintf("Invalid timezone: %s. Please provide a valid IANA timezone.", req.Timezone))
 	}
-	if _, ok := s.store.GetUserByEmail(email); ok {
+	if _, ok, err := s.store.GetUserByEmail(email); err != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	} else if ok {
 		return domain.TokenBundle{}, apperr.Conflict("Registration rejected", "This email address is already registered.")
 	}
 	passwordHash, err := auth.HashPassword(req.Password)
@@ -80,7 +82,10 @@ func (s *Service) Register(ctx context.Context, req domain.AuthRegisterRequest, 
 
 func (s *Service) Login(ctx context.Context, req domain.AuthLoginRequest, ip string) (domain.TokenBundle, error) {
 	email := auth.NormalizeEmail(req.Email)
-	user, ok := s.store.GetUserByEmail(email)
+	user, ok, err := s.store.GetUserByEmail(email)
+	if err != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.TokenBundle{}, apperr.Unauthorized("The email or password is incorrect.")
 	}
@@ -95,18 +100,29 @@ func (s *Service) Refresh(ctx context.Context, req domain.AuthRefreshRequest, ip
 		return domain.TokenBundle{}, apperr.Unauthorized("Session expired.")
 	}
 	hash := auth.HashRefreshToken(req.RefreshToken)
-	session, ok := s.store.GetSessionByRefreshHash(hash)
+	session, ok, err := s.store.GetSessionByRefreshHash(hash)
+	if err != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	}
 	if !ok || session.IsRevoked || time.Now().After(session.ExpiresAt) {
 		return domain.TokenBundle{}, apperr.Unauthorized("Session expired.")
 	}
-	user, ok := s.store.GetUserByID(session.UserID)
+	user, ok, err := s.store.GetUserByID(session.UserID)
+	if err != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.TokenBundle{}, apperr.NotFound()
 	}
 
-	// Rotate refresh token on each use
-	s.store.RevokeSessionByRefreshTokenHash(hash)
-	newRefresh := auth.GenerateRefreshToken()
+	// Rotate refresh token on each use – surface revocation errors
+	if rErr := s.store.RevokeSessionByRefreshTokenHash(hash); rErr != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	}
+	newRefresh, err := auth.GenerateRefreshToken()
+	if err != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	}
 	newSessionID := uuid.NewString()
 	newSession := domain.Session{
 		ID:               newSessionID,
@@ -133,11 +149,13 @@ func (s *Service) Logout(ctx context.Context, req domain.AuthLogoutRequest) erro
 	if req.RefreshToken == "" {
 		return nil
 	}
-	s.store.RevokeSessionByRefreshTokenHash(auth.HashRefreshToken(req.RefreshToken))
+	if err := s.store.RevokeSessionByRefreshTokenHash(auth.HashRefreshToken(req.RefreshToken)); err != nil {
+		return apperr.InternalServerError()
+	}
 	return nil
 }
 
-func (s *Service) GetUserByID(ctx context.Context, id string) (domain.User, bool) {
+func (s *Service) GetUserByID(ctx context.Context, id string) (domain.User, bool, error) {
 	return s.store.GetUserByID(id)
 }
 
@@ -146,7 +164,7 @@ func (s *Service) ListClusters(ctx context.Context) ([]domain.Cluster, error) {
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	return s.store.ListClusters(user.ID), nil
+	return s.store.ListClusters(user.ID)
 }
 
 func (s *Service) CreateCluster(ctx context.Context, req domain.ClusterCreateRequest) (domain.Cluster, error) {
@@ -170,7 +188,10 @@ func (s *Service) UpdateCluster(ctx context.Context, id string, req domain.Clust
 	if !ok {
 		return domain.Cluster{}, apperr.Unauthorized("Missing session.")
 	}
-	cluster, ok := s.store.GetClusterByID(user.ID, id)
+	cluster, ok, err := s.store.GetClusterByID(user.ID, id)
+	if err != nil {
+		return domain.Cluster{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.Cluster{}, apperr.NotFound()
 	}
@@ -185,7 +206,8 @@ func (s *Service) UpdateCluster(ctx context.Context, id string, req domain.Clust
 	}
 	if req.Archived != nil {
 		if *req.Archived {
-			now := time.Now().UTC(); cluster.DeletedAt = &now
+			now := time.Now().UTC()
+			cluster.DeletedAt = &now
 		} else {
 			cluster.DeletedAt = nil
 		}
@@ -201,7 +223,10 @@ func (s *Service) DeleteCluster(ctx context.Context, id string) error {
 	if !ok {
 		return apperr.Unauthorized("Missing session.")
 	}
-	cluster, ok := s.store.GetClusterByID(user.ID, id)
+	cluster, ok, err := s.store.GetClusterByID(user.ID, id)
+	if err != nil {
+		return apperr.InternalServerError()
+	}
 	if !ok {
 		return apperr.NotFound()
 	}
@@ -216,7 +241,7 @@ func (s *Service) ListActivities(ctx context.Context) ([]domain.Activity, error)
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	return s.store.ListActivities(user.ID), nil
+	return s.store.ListActivities(user.ID)
 }
 
 func (s *Service) CreateActivity(ctx context.Context, req domain.ActivityCreateRequest) (domain.Activity, error) {
@@ -227,11 +252,18 @@ func (s *Service) CreateActivity(ctx context.Context, req domain.ActivityCreateR
 	if strings.TrimSpace(req.Name) == "" {
 		return domain.Activity{}, apperr.InvalidRequest("Activity name is required.")
 	}
-	cluster, ok := s.store.GetClusterByID(user.ID, req.ClusterID)
+	cluster, ok, err := s.store.GetClusterByID(user.ID, req.ClusterID)
+	if err != nil {
+		return domain.Activity{}, apperr.InternalServerError()
+	}
 	if !ok || cluster.DeletedAt != nil {
 		return domain.Activity{}, apperr.UnprocessableEntity("Activity not created", "The selected cluster does not exist or is archived.", "CLUSTER_INVALID")
 	}
-	for _, existing := range s.store.ListActivities(user.ID) {
+	existingList, err := s.store.ListActivities(user.ID)
+	if err != nil {
+		return domain.Activity{}, apperr.InternalServerError()
+	}
+	for _, existing := range existingList {
 		if existing.ClusterID == req.ClusterID && existing.DeletedAt == nil && strings.EqualFold(existing.Name, req.Name) {
 			return domain.Activity{}, apperr.UnprocessableEntity("Activity not created", "An active activity with this name already exists in this cluster.", "DUPLICATE_ACTIVITY")
 		}
@@ -248,7 +280,10 @@ func (s *Service) UpdateActivity(ctx context.Context, id string, req domain.Acti
 	if !ok {
 		return domain.Activity{}, apperr.Unauthorized("Missing session.")
 	}
-	activity, ok := s.store.GetActivityByID(user.ID, id)
+	activity, ok, err := s.store.GetActivityByID(user.ID, id)
+	if err != nil {
+		return domain.Activity{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.Activity{}, apperr.NotFound()
 	}
@@ -256,7 +291,10 @@ func (s *Service) UpdateActivity(ctx context.Context, id string, req domain.Acti
 		activity.Name = strings.TrimSpace(req.Name)
 	}
 	if req.ClusterID != "" {
-		cluster, ok := s.store.GetClusterByID(user.ID, req.ClusterID)
+		cluster, ok, err := s.store.GetClusterByID(user.ID, req.ClusterID)
+		if err != nil {
+			return domain.Activity{}, apperr.InternalServerError()
+		}
 		if !ok || cluster.DeletedAt != nil {
 			return domain.Activity{}, apperr.UnprocessableEntity("Activity update rejected", "The selected cluster does not exist or is archived.", "CLUSTER_INVALID")
 		}
@@ -270,7 +308,8 @@ func (s *Service) UpdateActivity(ctx context.Context, id string, req domain.Acti
 	}
 	if req.Archived != nil {
 		if *req.Archived {
-			now := time.Now().UTC(); activity.DeletedAt = &now
+			now := time.Now().UTC()
+			activity.DeletedAt = &now
 		} else {
 			activity.DeletedAt = nil
 		}
@@ -286,7 +325,10 @@ func (s *Service) DeleteActivity(ctx context.Context, id string) error {
 	if !ok {
 		return apperr.Unauthorized("Missing session.")
 	}
-	_, ok = s.store.GetActivityByID(user.ID, id)
+	_, ok, err := s.store.GetActivityByID(user.ID, id)
+	if err != nil {
+		return apperr.InternalServerError()
+	}
 	if !ok {
 		return apperr.NotFound()
 	}
@@ -298,7 +340,10 @@ func (s *Service) ListLogs(ctx context.Context, filter domain.LogListFilter) ([]
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	logs := s.store.ListLogs(user.ID, filter)
+	logs, err := s.store.ListLogs(user.ID, filter)
+	if err != nil {
+		return nil, err
+	}
 	for i := range logs {
 		logs[i].Status = strings.ToLower(logs[i].EntryStatus)
 	}
@@ -310,11 +355,17 @@ func (s *Service) CreateLog(ctx context.Context, req domain.LogCreateRequest) (d
 	if !ok {
 		return domain.Log{}, apperr.Unauthorized("Missing session.")
 	}
-	activity, ok := s.store.GetActivityByID(user.ID, req.ActivityID)
+	activity, ok, err := s.store.GetActivityByID(user.ID, req.ActivityID)
+	if err != nil {
+		return domain.Log{}, apperr.InternalServerError()
+	}
 	if !ok || activity.DeletedAt != nil {
 		return domain.Log{}, apperr.UnprocessableEntity("Recording rejected", "This activity or its cluster is archived or does not exist.", "ACTIVITY_INVALID")
 	}
-	cluster, ok := s.store.GetClusterByID(user.ID, activity.ClusterID)
+	cluster, ok, err := s.store.GetClusterByID(user.ID, activity.ClusterID)
+	if err != nil {
+		return domain.Log{}, apperr.InternalServerError()
+	}
 	if !ok || cluster.DeletedAt != nil {
 		return domain.Log{}, apperr.UnprocessableEntity("Recording rejected", "This activity or its cluster is archived or does not exist.", "CLUSTER_INVALID")
 	}
@@ -366,7 +417,10 @@ func (s *Service) GetLog(ctx context.Context, id string) (domain.Log, error) {
 	if !ok {
 		return domain.Log{}, apperr.Unauthorized("Missing session.")
 	}
-	log, ok := s.store.GetLogByID(user.ID, id)
+	log, ok, err := s.store.GetLogByID(user.ID, id)
+	if err != nil {
+		return domain.Log{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.Log{}, apperr.NotFound()
 	}
@@ -379,7 +433,10 @@ func (s *Service) UpdateLog(ctx context.Context, id string, req domain.LogUpdate
 	if !ok {
 		return domain.Log{}, apperr.Unauthorized("Missing session.")
 	}
-	log, ok := s.store.GetLogByID(user.ID, id)
+	log, ok, err := s.store.GetLogByID(user.ID, id)
+	if err != nil {
+		return domain.Log{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.Log{}, apperr.NotFound()
 	}
@@ -387,7 +444,10 @@ func (s *Service) UpdateLog(ctx context.Context, id string, req domain.LogUpdate
 	if now.Sub(log.StartTime) >= lateWindow {
 		return domain.Log{}, apperr.UnprocessableEntity("Edit rejected", "This record started more than 24 hours ago and is permanently locked.\n\nThis restriction protects the integrity of historical data.", "LOCKED_LOG")
 	}
-	activity, ok := s.store.GetActivityByID(user.ID, log.ActivityID)
+	activity, ok, err := s.store.GetActivityByID(user.ID, log.ActivityID)
+	if err != nil {
+		return domain.Log{}, apperr.InternalServerError()
+	}
 	if !ok {
 		return domain.Log{}, apperr.NotFound()
 	}
@@ -399,7 +459,7 @@ func (s *Service) UpdateLog(ctx context.Context, id string, req domain.LogUpdate
 		if err != nil {
 			return domain.Log{}, apperr.InvalidRequest("The start time is invalid.")
 		}
-		if newStart.After(now.Add(5*time.Minute)) {
+		if newStart.After(now.Add(5 * time.Minute)) {
 			return domain.Log{}, apperr.UnprocessableEntity("Edit rejected", "The start time is in the future.", "FUTURE_START")
 		}
 		log.StartTime = newStart
@@ -414,7 +474,7 @@ func (s *Service) UpdateLog(ctx context.Context, id string, req domain.LogUpdate
 			if newEnd.Before(log.StartTime) {
 				return domain.Log{}, apperr.UnprocessableEntity("Edit rejected", "The end time cannot be earlier than the start time.", "DURATION_INVALID")
 			}
-			if newEnd.After(now.Add(5*time.Minute)) {
+			if newEnd.After(now.Add(5 * time.Minute)) {
 				return domain.Log{}, apperr.UnprocessableEntity("Edit rejected", "The end time is in the future.", "FUTURE_END_TIME")
 			}
 			log.EndTime = &newEnd
@@ -449,7 +509,10 @@ func (s *Service) DeleteLog(ctx context.Context, id string) error {
 	if !ok {
 		return apperr.Unauthorized("Missing session.")
 	}
-	log, ok := s.store.GetLogByID(user.ID, id)
+	log, ok, err := s.store.GetLogByID(user.ID, id)
+	if err != nil {
+		return apperr.InternalServerError()
+	}
 	if !ok {
 		return apperr.NotFound()
 	}
@@ -465,7 +528,7 @@ func (s *Service) ListAuditForLog(ctx context.Context, logID string) ([]domain.A
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	return s.store.ListAuditForLog(user.ID, logID), nil
+	return s.store.ListAuditForLog(user.ID, logID)
 }
 
 func (s *Service) ListAudit(ctx context.Context, filter domain.AuditListFilter) ([]domain.Audit, error) {
@@ -473,7 +536,7 @@ func (s *Service) ListAudit(ctx context.Context, filter domain.AuditListFilter) 
 	if !ok {
 		return nil, apperr.Unauthorized("Missing session.")
 	}
-	return s.store.ListAudit(user.ID, filter), nil
+	return s.store.ListAudit(user.ID, filter)
 }
 
 func (s *Service) Reset(ctx context.Context) error {
@@ -485,12 +548,15 @@ func (s *Service) Reset(ctx context.Context) error {
 }
 
 func currentUser(ctx context.Context) (domain.User, bool) {
-	user, ok := ctx.Value("user").(domain.User)
+	user, ok := ctx.Value(domain.UserContextKey).(domain.User)
 	return user, ok
 }
 
 func (s *Service) issueTokensForUser(user domain.User, ip string) (domain.TokenBundle, error) {
-	refresh := auth.GenerateRefreshToken()
+	refresh, err := auth.GenerateRefreshToken()
+	if err != nil {
+		return domain.TokenBundle{}, apperr.InternalServerError()
+	}
 	sessionID := uuid.NewString()
 	access, err := auth.GenerateAccessToken(user.ID, sessionID, s.cfg.JWTSecret, s.cfg.AccessTokenTTL)
 	if err != nil {
@@ -521,10 +587,18 @@ func parseTime(value any) (time.Time, error) {
 		return v.UTC(), nil
 	case string:
 		trim := strings.TrimSpace(v)
-		if trim == "" { return time.Time{}, fmt.Errorf("empty time") }
-		if ts, err := time.Parse(time.RFC3339, trim); err == nil { return ts.UTC(), nil }
-		if ts, err := time.Parse("2006-01-02T15:04:05", trim); err == nil { return ts.UTC(), nil }
-		if ts, err := time.Parse("2006-01-02 15:04:05", trim); err == nil { return ts.UTC(), nil }
+		if trim == "" {
+			return time.Time{}, fmt.Errorf("empty time")
+		}
+		if ts, err := time.Parse(time.RFC3339, trim); err == nil {
+			return ts.UTC(), nil
+		}
+		if ts, err := time.Parse("2006-01-02T15:04:05", trim); err == nil {
+			return ts.UTC(), nil
+		}
+		if ts, err := time.Parse("2006-01-02 15:04:05", trim); err == nil {
+			return ts.UTC(), nil
+		}
 		return time.Time{}, fmt.Errorf("invalid time: %s", trim)
 	case float64:
 		return time.Unix(0, int64(v)*int64(time.Millisecond)).UTC(), nil
@@ -560,12 +634,16 @@ func parseFloat(value any) (float64, error) {
 func float64Ptr(v float64) *float64 { return &v }
 
 func sameTimePtr(a, b *time.Time) bool {
-	if a == nil || b == nil { return a == nil && b == nil }
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
 	return a.Equal(*b)
 }
 
 func sameFloatPtr(a, b *float64) bool {
-	if a == nil || b == nil { return a == nil && b == nil }
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
 	return *a == *b
 }
 

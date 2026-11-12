@@ -95,11 +95,11 @@ func newTestService(t *testing.T) (*Service, *repository.PostgresStore, domain.U
 	if _, err := svc.Register(context.Background(), userReq, "127.0.0.1"); err != nil {
 		t.Fatalf("register test user: %v", err)
 	}
-	user, ok := store.GetUserByEmail(email)
-	if !ok {
-		t.Fatalf("missing registered user: %s", email)
+	user, ok, err := store.GetUserByEmail(email)
+	if err != nil || !ok {
+		t.Fatalf("missing registered user: %s, err: %v", email, err)
 	}
-	ctx := context.WithValue(context.Background(), "user", user)
+	ctx := context.WithValue(context.Background(), domain.UserContextKey, user)
 	return svc, store, user, ctx
 }
 

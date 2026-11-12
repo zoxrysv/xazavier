@@ -9,45 +9,45 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"xazavier/internal/apperr"
 	"xazavier/internal/domain"
 	"xazavier/migrations"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Store is the repository contract used by the service layer.
 type Store interface {
+	Ping(ctx context.Context) error
 	CreateUser(user domain.User) error
-	GetUserByEmail(email string) (domain.User, bool)
-	GetUserByID(id string) (domain.User, bool)
-	ListUsers() []domain.User
+	GetUserByEmail(email string) (domain.User, bool, error)
+	GetUserByID(id string) (domain.User, bool, error)
 	AddSession(session domain.Session) error
-	GetSessionByID(id string) (domain.Session, bool)
-	GetSessionByRefreshHash(hash string) (domain.Session, bool)
-	RevokeSessionByRefreshTokenHash(hash string)
-	ListSessionsForUser(userID string) []domain.Session
-	ListClusters(userID string) []domain.Cluster
-	GetClusterByID(userID, id string) (domain.Cluster, bool)
+	GetSessionByID(id string) (domain.Session, bool, error)
+	GetSessionByRefreshHash(hash string) (domain.Session, bool, error)
+	RevokeSessionByRefreshTokenHash(hash string) error
+	ListClusters(userID string) ([]domain.Cluster, error)
+	GetClusterByID(userID, id string) (domain.Cluster, bool, error)
 	AddCluster(cluster domain.Cluster) error
 	UpdateCluster(cluster domain.Cluster) error
 	DeleteCluster(userID, id string) error
-	ListActivities(userID string) []domain.Activity
-	GetActivityByID(userID, id string) (domain.Activity, bool)
+	ListActivities(userID string) ([]domain.Activity, error)
+	GetActivityByID(userID, id string) (domain.Activity, bool, error)
 	AddActivity(activity domain.Activity) error
 	UpdateActivity(activity domain.Activity) error
 	DeleteActivity(userID, id string) error
-	ListLogs(userID string, filter domain.LogListFilter) []domain.Log
-	GetLogByID(userID, id string) (domain.Log, bool)
+	ListLogs(userID string, filter domain.LogListFilter) ([]domain.Log, error)
+	GetLogByID(userID, id string) (domain.Log, bool, error)
 	AddLog(log domain.Log) error
 	UpdateLog(log domain.Log) error
 	DeleteLog(userID, id string) error
 	UpdateLogWithAudit(log domain.Log, audit *domain.Audit) error
 	DeleteLogWithAudit(userID, id string, audit domain.Audit) error
-	ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit
+	ListAudit(userID string, filter domain.AuditListFilter) ([]domain.Audit, error)
 	AddAudit(audit domain.Audit) error
-	ListAuditForLog(userID, logID string) []domain.Audit
+	ListAuditForLog(userID, logID string) ([]domain.Audit, error)
 	ResetUserData(userID string) error
 }
 
@@ -122,6 +122,19 @@ func AutoMigrate(ctx context.Context, databaseURL string) error {
 	}
 	defer store.Close()
 
+	// Acquire advisory lock to prevent race conditions during multi-instance startup
+	const migrationLockID = 482910482019
+	var lockAcquired bool
+	if err := store.pool.QueryRow(ctx, "SELECT pg_advisory_lock($1)", migrationLockID).Scan(&lockAcquired); err != nil {
+		// pg_advisory_lock returns void, scan error is ignorable as long as Exec succeeds
+		if _, err := store.pool.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
+			return fmt.Errorf("acquire migration lock: %w", err)
+		}
+	}
+	defer func() {
+		_, _ = store.pool.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", migrationLockID)
+	}()
+
 	// Ensure migration tracking table exists.
 	_, err = store.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -169,11 +182,23 @@ func AutoMigrate(ctx context.Context, databaseURL string) error {
 		if err != nil {
 			return err
 		}
-		if _, err := store.pool.Exec(ctx, string(content)); err != nil {
+
+		// Execute each migration file atomically inside its own transaction
+		tx, err := store.pool.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin tx for %s: %w", name, err)
+		}
+
+		if _, err := tx.Exec(ctx, string(content)); err != nil {
+			_ = tx.Rollback(ctx)
 			return fmt.Errorf("migrate %s: %w", name, err)
 		}
-		if _, err := store.pool.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, name); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version) VALUES ($1)`, name); err != nil {
+			_ = tx.Rollback(ctx)
 			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit migration %s: %w", name, err)
 		}
 	}
 	return nil
@@ -187,45 +212,35 @@ func (s *PostgresStore) CreateUser(user domain.User) error {
 	return mapDBError(err, "Registration rejected", "This email address is already registered.")
 }
 
-func (s *PostgresStore) GetUserByEmail(email string) (domain.User, bool) {
+func (s *PostgresStore) Ping(ctx context.Context) error {
+	if s == nil || s.pool == nil {
+		return errors.New("database pool is not initialized")
+	}
+	return s.pool.Ping(ctx)
+}
+
+func (s *PostgresStore) GetUserByEmail(email string) (domain.User, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,email,password_hash,full_name,timezone,created_at FROM users WHERE email = $1`, strings.ToLower(strings.TrimSpace(email)))
 	var user domain.User
 	if err := row.Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FullName, &user.Timezone, &user.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.User{}, false
+			return domain.User{}, false, nil
 		}
-		return domain.User{}, false
+		return domain.User{}, false, fmt.Errorf("get user by email: %w", err)
 	}
-	return user, true
+	return user, true, nil
 }
 
-func (s *PostgresStore) GetUserByID(id string) (domain.User, bool) {
+func (s *PostgresStore) GetUserByID(id string) (domain.User, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,email,password_hash,full_name,timezone,created_at FROM users WHERE id = $1`, id)
 	var user domain.User
 	if err := row.Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FullName, &user.Timezone, &user.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.User{}, false
+			return domain.User{}, false, nil
 		}
-		return domain.User{}, false
+		return domain.User{}, false, fmt.Errorf("get user by id: %w", err)
 	}
-	return user, true
-}
-
-func (s *PostgresStore) ListUsers() []domain.User {
-	rows, err := s.pool.Query(context.Background(), `SELECT id,email,password_hash,full_name,timezone,created_at FROM users ORDER BY created_at ASC`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make([]domain.User, 0)
-	for rows.Next() {
-		var user domain.User
-		if err := rows.Scan(&user.ID, &user.Email, &user.PasswordHash, &user.FullName, &user.Timezone, &user.CreatedAt); err != nil {
-			continue
-		}
-		out = append(out, user)
-	}
-	return out
+	return user, true, nil
 }
 
 func (s *PostgresStore) AddSession(session domain.Session) error {
@@ -236,55 +251,39 @@ func (s *PostgresStore) AddSession(session domain.Session) error {
 	return mapDBError(err, "Session rejected", "Unable to create session.")
 }
 
-func (s *PostgresStore) GetSessionByID(id string) (domain.Session, bool) {
+func (s *PostgresStore) GetSessionByID(id string) (domain.Session, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,user_id,refresh_token_hash,user_agent,ip_address,is_revoked,expires_at,created_at FROM sessions WHERE id = $1`, id)
 	var session domain.Session
 	if err := row.Scan(&session.ID, &session.UserID, &session.RefreshTokenHash, &session.UserAgent, &session.IPAddress, &session.IsRevoked, &session.ExpiresAt, &session.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Session{}, false
+			return domain.Session{}, false, nil
 		}
-		return domain.Session{}, false
+		return domain.Session{}, false, fmt.Errorf("get session by id: %w", err)
 	}
-	return session, true
+	return session, true, nil
 }
 
-func (s *PostgresStore) GetSessionByRefreshHash(hash string) (domain.Session, bool) {
+func (s *PostgresStore) GetSessionByRefreshHash(hash string) (domain.Session, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,user_id,refresh_token_hash,user_agent,ip_address,is_revoked,expires_at,created_at FROM sessions WHERE refresh_token_hash = $1 ORDER BY created_at DESC LIMIT 1`, hash)
 	var session domain.Session
 	if err := row.Scan(&session.ID, &session.UserID, &session.RefreshTokenHash, &session.UserAgent, &session.IPAddress, &session.IsRevoked, &session.ExpiresAt, &session.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Session{}, false
+			return domain.Session{}, false, nil
 		}
-		return domain.Session{}, false
+		return domain.Session{}, false, fmt.Errorf("get session by hash: %w", err)
 	}
-	return session, true
+	return session, true, nil
 }
 
-func (s *PostgresStore) RevokeSessionByRefreshTokenHash(hash string) {
-	_, _ = s.pool.Exec(context.Background(), `UPDATE sessions SET is_revoked = true WHERE refresh_token_hash = $1`, hash)
+func (s *PostgresStore) RevokeSessionByRefreshTokenHash(hash string) error {
+	_, err := s.pool.Exec(context.Background(), `UPDATE sessions SET is_revoked = true WHERE refresh_token_hash = $1`, hash)
+	return err
 }
 
-func (s *PostgresStore) ListSessionsForUser(userID string) []domain.Session {
-	rows, err := s.pool.Query(context.Background(), `SELECT id,user_id,refresh_token_hash,user_agent,ip_address,is_revoked,expires_at,created_at FROM sessions WHERE user_id = $1 ORDER BY created_at DESC`, userID)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make([]domain.Session, 0)
-	for rows.Next() {
-		var session domain.Session
-		if err := rows.Scan(&session.ID, &session.UserID, &session.RefreshTokenHash, &session.UserAgent, &session.IPAddress, &session.IsRevoked, &session.ExpiresAt, &session.CreatedAt); err != nil {
-			continue
-		}
-		out = append(out, session)
-	}
-	return out
-}
-
-func (s *PostgresStore) ListClusters(userID string) []domain.Cluster {
+func (s *PostgresStore) ListClusters(userID string) ([]domain.Cluster, error) {
 	rows, err := s.pool.Query(context.Background(), `SELECT id,user_id,name,icon,color,deleted_at,created_at FROM clusters WHERE user_id = $1 ORDER BY created_at ASC`, userID)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list clusters: %w", err)
 	}
 	defer rows.Close()
 	out := make([]domain.Cluster, 0)
@@ -292,26 +291,26 @@ func (s *PostgresStore) ListClusters(userID string) []domain.Cluster {
 		var cluster domain.Cluster
 		var deletedAt *time.Time
 		if err := rows.Scan(&cluster.ID, &cluster.UserID, &cluster.Name, &cluster.Icon, &cluster.Color, &deletedAt, &cluster.CreatedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan cluster: %w", err)
 		}
 		cluster.DeletedAt = deletedAt
 		out = append(out, cluster)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *PostgresStore) GetClusterByID(userID, id string) (domain.Cluster, bool) {
+func (s *PostgresStore) GetClusterByID(userID, id string) (domain.Cluster, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,user_id,name,icon,color,deleted_at,created_at FROM clusters WHERE user_id = $1 AND id = $2`, userID, id)
 	var cluster domain.Cluster
 	var deletedAt *time.Time
 	if err := row.Scan(&cluster.ID, &cluster.UserID, &cluster.Name, &cluster.Icon, &cluster.Color, &deletedAt, &cluster.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Cluster{}, false
+			return domain.Cluster{}, false, nil
 		}
-		return domain.Cluster{}, false
+		return domain.Cluster{}, false, fmt.Errorf("get cluster by id: %w", err)
 	}
 	cluster.DeletedAt = deletedAt
-	return cluster, true
+	return cluster, true, nil
 }
 
 func (s *PostgresStore) AddCluster(cluster domain.Cluster) error {
@@ -336,10 +335,10 @@ func (s *PostgresStore) DeleteCluster(userID, id string) error {
 	return mapDBError(err, "Cluster not deleted", "The selected cluster could not be deleted.")
 }
 
-func (s *PostgresStore) ListActivities(userID string) []domain.Activity {
+func (s *PostgresStore) ListActivities(userID string) ([]domain.Activity, error) {
 	rows, err := s.pool.Query(context.Background(), `SELECT id,cluster_id,user_id,name,tracking_type,unit_name,deleted_at,created_at FROM activities WHERE user_id = $1 ORDER BY created_at ASC`, userID)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list activities: %w", err)
 	}
 	defer rows.Close()
 	out := make([]domain.Activity, 0)
@@ -347,26 +346,26 @@ func (s *PostgresStore) ListActivities(userID string) []domain.Activity {
 		var activity domain.Activity
 		var deletedAt *time.Time
 		if err := rows.Scan(&activity.ID, &activity.ClusterID, &activity.UserID, &activity.Name, &activity.TrackingType, &activity.UnitName, &deletedAt, &activity.CreatedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan activity: %w", err)
 		}
 		activity.DeletedAt = deletedAt
 		out = append(out, activity)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *PostgresStore) GetActivityByID(userID, id string) (domain.Activity, bool) {
+func (s *PostgresStore) GetActivityByID(userID, id string) (domain.Activity, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,cluster_id,user_id,name,tracking_type,unit_name,deleted_at,created_at FROM activities WHERE user_id = $1 AND id = $2`, userID, id)
 	var activity domain.Activity
 	var deletedAt *time.Time
 	if err := row.Scan(&activity.ID, &activity.ClusterID, &activity.UserID, &activity.Name, &activity.TrackingType, &activity.UnitName, &deletedAt, &activity.CreatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Activity{}, false
+			return domain.Activity{}, false, nil
 		}
-		return domain.Activity{}, false
+		return domain.Activity{}, false, fmt.Errorf("get activity by id: %w", err)
 	}
 	activity.DeletedAt = deletedAt
-	return activity, true
+	return activity, true, nil
 }
 
 func (s *PostgresStore) AddActivity(activity domain.Activity) error {
@@ -389,7 +388,7 @@ func (s *PostgresStore) DeleteActivity(userID, id string) error {
 	return mapDBError(err, "Activity not deleted", "The selected activity could not be deleted.")
 }
 
-func (s *PostgresStore) ListLogs(userID string, filter domain.LogListFilter) []domain.Log {
+func (s *PostgresStore) ListLogs(userID string, filter domain.LogListFilter) ([]domain.Log, error) {
 	query := `SELECT id,activity_id,user_id,log_date::text,start_time,end_time,logged_value,entry_status,status,notes,created_at,updated_at,edited FROM logs WHERE user_id = $1`
 	args := []any{userID}
 	argIdx := 2
@@ -420,7 +419,7 @@ func (s *PostgresStore) ListLogs(userID string, filter domain.LogListFilter) []d
 
 	rows, err := s.pool.Query(context.Background(), query, args...)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list logs: %w", err)
 	}
 	defer rows.Close()
 	out := make([]domain.Log, 0)
@@ -429,29 +428,29 @@ func (s *PostgresStore) ListLogs(userID string, filter domain.LogListFilter) []d
 		var endTime *time.Time
 		var loggedValue *float64
 		if err := rows.Scan(&log.ID, &log.ActivityID, &log.UserID, &log.LogDate, &log.StartTime, &endTime, &loggedValue, &log.EntryStatus, &log.Status, &log.Notes, &log.CreatedAt, &log.UpdatedAt, &log.Edited); err != nil {
-			continue
+			return nil, fmt.Errorf("scan log: %w", err)
 		}
 		log.EndTime = endTime
 		log.LoggedValue = loggedValue
 		out = append(out, log)
 	}
-	return out
+	return out, rows.Err()
 }
 
-func (s *PostgresStore) GetLogByID(userID, id string) (domain.Log, bool) {
+func (s *PostgresStore) GetLogByID(userID, id string) (domain.Log, bool, error) {
 	row := s.pool.QueryRow(context.Background(), `SELECT id,activity_id,user_id,log_date::text,start_time,end_time,logged_value,entry_status,status,notes,created_at,updated_at,edited FROM logs WHERE user_id = $1 AND id = $2`, userID, id)
 	var log domain.Log
 	var endTime *time.Time
 	var loggedValue *float64
 	if err := row.Scan(&log.ID, &log.ActivityID, &log.UserID, &log.LogDate, &log.StartTime, &endTime, &loggedValue, &log.EntryStatus, &log.Status, &log.Notes, &log.CreatedAt, &log.UpdatedAt, &log.Edited); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Log{}, false
+			return domain.Log{}, false, nil
 		}
-		return domain.Log{}, false
+		return domain.Log{}, false, fmt.Errorf("get log by id: %w", err)
 	}
 	log.EndTime = endTime
 	log.LoggedValue = loggedValue
-	return log, true
+	return log, true, nil
 }
 
 func (s *PostgresStore) AddLog(log domain.Log) error {
@@ -530,7 +529,7 @@ func (s *PostgresStore) DeleteLogWithAudit(userID, id string, audit domain.Audit
 	return tx.Commit(ctx)
 }
 
-func (s *PostgresStore) ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit {
+func (s *PostgresStore) ListAudit(userID string, filter domain.AuditListFilter) ([]domain.Audit, error) {
 	query := `SELECT id,user_id,log_id,action_type,old_start_time,old_end_time,old_logged_value,changed_at FROM audit WHERE user_id = $1 ORDER BY changed_at ASC`
 	args := []any{userID}
 	argIdx := 2
@@ -548,7 +547,7 @@ func (s *PostgresStore) ListAudit(userID string, filter domain.AuditListFilter) 
 
 	rows, err := s.pool.Query(context.Background(), query, args...)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list audit: %w", err)
 	}
 	defer rows.Close()
 	out := make([]domain.Audit, 0)
@@ -558,14 +557,14 @@ func (s *PostgresStore) ListAudit(userID string, filter domain.AuditListFilter) 
 		var oldEnd *time.Time
 		var oldLoggedValue *float64
 		if err := rows.Scan(&audit.ID, &audit.UserID, &audit.LogID, &audit.ActionType, &oldStart, &oldEnd, &oldLoggedValue, &audit.ChangedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan audit: %w", err)
 		}
 		audit.OldStartTime = oldStart
 		audit.OldEndTime = oldEnd
 		audit.OldLoggedValue = oldLoggedValue
 		out = append(out, audit)
 	}
-	return out
+	return out, rows.Err()
 }
 
 func (s *PostgresStore) AddAudit(audit domain.Audit) error {
@@ -576,10 +575,10 @@ func (s *PostgresStore) AddAudit(audit domain.Audit) error {
 	return mapDBError(err, "Audit rejected", "This change could not be recorded.")
 }
 
-func (s *PostgresStore) ListAuditForLog(userID, logID string) []domain.Audit {
+func (s *PostgresStore) ListAuditForLog(userID, logID string) ([]domain.Audit, error) {
 	rows, err := s.pool.Query(context.Background(), `SELECT id,user_id,log_id,action_type,old_start_time,old_end_time,old_logged_value,changed_at FROM audit WHERE user_id = $1 AND log_id = $2 ORDER BY changed_at ASC`, userID, logID)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list audit for log: %w", err)
 	}
 	defer rows.Close()
 	out := make([]domain.Audit, 0)
@@ -589,14 +588,14 @@ func (s *PostgresStore) ListAuditForLog(userID, logID string) []domain.Audit {
 		var oldEnd *time.Time
 		var oldLoggedValue *float64
 		if err := rows.Scan(&audit.ID, &audit.UserID, &audit.LogID, &audit.ActionType, &oldStart, &oldEnd, &oldLoggedValue, &audit.ChangedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan audit for log: %w", err)
 		}
 		audit.OldStartTime = oldStart
 		audit.OldEndTime = oldEnd
 		audit.OldLoggedValue = oldLoggedValue
 		out = append(out, audit)
 	}
-	return out
+	return out, rows.Err()
 }
 
 func (s *PostgresStore) ResetUserData(userID string) error {
@@ -610,8 +609,9 @@ func (s *PostgresStore) ResetUserData(userID string) error {
 	// In PostgreSQL, reset must bypass 24h delete guard trigger or disable trigger for the transaction
 	// if dropping all logs. Alternatively, set session_replication_role or drop logs within tx.
 	// Since logs has a BEFORE DELETE trigger "logs_delete_guard", standard DELETE will fail on logs older than 24h.
-	// We disable the trigger locally in this transaction.
+	// We disable the triggers locally in this transaction.
 	_, _ = tx.Exec(ctx, `ALTER TABLE logs DISABLE TRIGGER logs_delete_guard`)
+	_, _ = tx.Exec(ctx, `ALTER TABLE audit DISABLE TRIGGER audit_immutable_trigger`)
 
 	_, err = tx.Exec(ctx, `DELETE FROM audit WHERE user_id = $1`, userID)
 	if err != nil {
@@ -622,6 +622,7 @@ func (s *PostgresStore) ResetUserData(userID string) error {
 		return mapDBError(err, "Reset rejected", "The data could not be reset.")
 	}
 	_, _ = tx.Exec(ctx, `ALTER TABLE logs ENABLE TRIGGER logs_delete_guard`)
+	_, _ = tx.Exec(ctx, `ALTER TABLE audit ENABLE TRIGGER audit_immutable_trigger`)
 
 	_, err = tx.Exec(ctx, `DELETE FROM activities WHERE user_id = $1`, userID)
 	if err != nil {

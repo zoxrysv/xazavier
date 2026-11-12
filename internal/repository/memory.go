@@ -1,16 +1,18 @@
 package repository
 
 import (
+	"context"
+	"encoding/base64"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"xazavier/internal/apperr"
+	"xazavier/internal/domain"
 
 	"github.com/google/uuid"
 	"golang.org/x/crypto/argon2"
-	"xazavier/internal/apperr"
-	"xazavier/internal/domain"
 )
 
 // MemStore is an in-memory thread-safe implementation of repository.Store.
@@ -18,13 +20,13 @@ import (
 // and enables ultra-fast, dependency-free unit testing.
 type MemStore struct {
 	mu             sync.RWMutex
-	users          map[string]domain.User       // id -> user
+	users          map[string]domain.User     // id -> user
 	usersByEmail   map[string]string          // lower(email) -> id
-	sessions       map[string]domain.Session    // id -> session
+	sessions       map[string]domain.Session  // id -> session
 	sessionsByHash map[string]string          // hash -> id
-	clusters       map[string]domain.Cluster    // id -> cluster
-	activities     map[string]domain.Activity   // id -> activity
-	logs           map[string]domain.Log        // id -> log
+	clusters       map[string]domain.Cluster  // id -> cluster
+	activities     map[string]domain.Activity // id -> activity
+	logs           map[string]domain.Log      // id -> log
 	audit          []domain.Audit
 }
 
@@ -57,38 +59,28 @@ func (m *MemStore) CreateUser(user domain.User) error {
 	return nil
 }
 
-func (m *MemStore) GetUserByEmail(email string) (domain.User, bool) {
+func (m *MemStore) Ping(ctx context.Context) error {
+	return nil
+}
+
+func (m *MemStore) GetUserByEmail(email string) (domain.User, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	id, ok := m.usersByEmail[strings.ToLower(strings.TrimSpace(email))]
 	if !ok {
-		return domain.User{}, false
+		return domain.User{}, false, nil
 	}
 	user, ok := m.users[id]
-	return user, ok
+	return user, ok, nil
 }
 
-func (m *MemStore) GetUserByID(id string) (domain.User, bool) {
+func (m *MemStore) GetUserByID(id string) (domain.User, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	user, ok := m.users[id]
-	return user, ok
-}
-
-func (m *MemStore) ListUsers() []domain.User {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	out := make([]domain.User, 0, len(m.users))
-	for _, u := range m.users {
-		out = append(out, u)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.Before(out[j].CreatedAt)
-	})
-	return out
+	return user, ok, nil
 }
 
 // Session methods
@@ -102,27 +94,27 @@ func (m *MemStore) AddSession(session domain.Session) error {
 	return nil
 }
 
-func (m *MemStore) GetSessionByID(id string) (domain.Session, bool) {
+func (m *MemStore) GetSessionByID(id string) (domain.Session, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	s, ok := m.sessions[id]
-	return s, ok
+	return s, ok, nil
 }
 
-func (m *MemStore) GetSessionByRefreshHash(hash string) (domain.Session, bool) {
+func (m *MemStore) GetSessionByRefreshHash(hash string) (domain.Session, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	id, ok := m.sessionsByHash[hash]
 	if !ok {
-		return domain.Session{}, false
+		return domain.Session{}, false, nil
 	}
 	s, ok := m.sessions[id]
-	return s, ok
+	return s, ok, nil
 }
 
-func (m *MemStore) RevokeSessionByRefreshTokenHash(hash string) {
+func (m *MemStore) RevokeSessionByRefreshTokenHash(hash string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -132,27 +124,12 @@ func (m *MemStore) RevokeSessionByRefreshTokenHash(hash string) {
 			m.sessions[id] = s
 		}
 	}
-}
-
-func (m *MemStore) ListSessionsForUser(userID string) []domain.Session {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	out := make([]domain.Session, 0)
-	for _, s := range m.sessions {
-		if s.UserID == userID {
-			out = append(out, s)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].CreatedAt.After(out[j].CreatedAt)
-	})
-	return out
+	return nil
 }
 
 // Cluster methods
 
-func (m *MemStore) ListClusters(userID string) []domain.Cluster {
+func (m *MemStore) ListClusters(userID string) ([]domain.Cluster, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -165,18 +142,18 @@ func (m *MemStore) ListClusters(userID string) []domain.Cluster {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
-	return out
+	return out, nil
 }
 
-func (m *MemStore) GetClusterByID(userID, id string) (domain.Cluster, bool) {
+func (m *MemStore) GetClusterByID(userID, id string) (domain.Cluster, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	c, ok := m.clusters[id]
 	if !ok || c.UserID != userID {
-		return domain.Cluster{}, false
+		return domain.Cluster{}, false, nil
 	}
-	return c, true
+	return c, true, nil
 }
 
 func (m *MemStore) AddCluster(cluster domain.Cluster) error {
@@ -225,7 +202,7 @@ func (m *MemStore) DeleteCluster(userID, id string) error {
 
 // Activity methods
 
-func (m *MemStore) ListActivities(userID string) []domain.Activity {
+func (m *MemStore) ListActivities(userID string) ([]domain.Activity, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -238,18 +215,18 @@ func (m *MemStore) ListActivities(userID string) []domain.Activity {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
-	return out
+	return out, nil
 }
 
-func (m *MemStore) GetActivityByID(userID, id string) (domain.Activity, bool) {
+func (m *MemStore) GetActivityByID(userID, id string) (domain.Activity, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	a, ok := m.activities[id]
 	if !ok || a.UserID != userID {
-		return domain.Activity{}, false
+		return domain.Activity{}, false, nil
 	}
-	return a, true
+	return a, true, nil
 }
 
 func (m *MemStore) AddActivity(activity domain.Activity) error {
@@ -298,7 +275,7 @@ func (m *MemStore) DeleteActivity(userID, id string) error {
 
 // Log methods
 
-func (m *MemStore) ListLogs(userID string, filter domain.LogListFilter) []domain.Log {
+func (m *MemStore) ListLogs(userID string, filter domain.LogListFilter) ([]domain.Log, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -321,7 +298,7 @@ func (m *MemStore) ListLogs(userID string, filter domain.LogListFilter) []domain
 
 	if filter.Offset > 0 {
 		if filter.Offset >= len(out) {
-			return []domain.Log{}
+			return []domain.Log{}, nil
 		}
 		out = out[filter.Offset:]
 	}
@@ -329,18 +306,18 @@ func (m *MemStore) ListLogs(userID string, filter domain.LogListFilter) []domain
 		out = out[:filter.Limit]
 	}
 
-	return out
+	return out, nil
 }
 
-func (m *MemStore) GetLogByID(userID, id string) (domain.Log, bool) {
+func (m *MemStore) GetLogByID(userID, id string) (domain.Log, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	l, ok := m.logs[id]
 	if !ok || l.UserID != userID {
-		return domain.Log{}, false
+		return domain.Log{}, false, nil
 	}
-	return l, true
+	return l, true, nil
 }
 
 func (m *MemStore) AddLog(log domain.Log) error {
@@ -405,7 +382,7 @@ func (m *MemStore) DeleteLogWithAudit(userID, id string, audit domain.Audit) err
 
 // Audit methods
 
-func (m *MemStore) ListAudit(userID string, filter domain.AuditListFilter) []domain.Audit {
+func (m *MemStore) ListAudit(userID string, filter domain.AuditListFilter) ([]domain.Audit, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -421,7 +398,7 @@ func (m *MemStore) ListAudit(userID string, filter domain.AuditListFilter) []dom
 
 	if filter.Offset > 0 {
 		if filter.Offset >= len(out) {
-			return []domain.Audit{}
+			return []domain.Audit{}, nil
 		}
 		out = out[filter.Offset:]
 	}
@@ -429,7 +406,7 @@ func (m *MemStore) ListAudit(userID string, filter domain.AuditListFilter) []dom
 		out = out[:filter.Limit]
 	}
 
-	return out
+	return out, nil
 }
 
 func (m *MemStore) AddAudit(audit domain.Audit) error {
@@ -440,7 +417,7 @@ func (m *MemStore) AddAudit(audit domain.Audit) error {
 	return nil
 }
 
-func (m *MemStore) ListAuditForLog(userID, logID string) []domain.Audit {
+func (m *MemStore) ListAuditForLog(userID, logID string) ([]domain.Audit, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -453,7 +430,7 @@ func (m *MemStore) ListAuditForLog(userID, logID string) []domain.Audit {
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].ChangedAt.Before(out[j].ChangedAt)
 	})
-	return out
+	return out, nil
 }
 
 // ResetUserData removes all data associated with the user
@@ -510,7 +487,10 @@ func SeedMemoryStore(store Store) {
 	// Demo user
 	salt := []byte("xazavier-seed-salt")
 	key := argon2.IDKey([]byte("demo1234"), salt, 1, 64*1024, 4, 32)
-	pwHash := fmt.Sprintf("$argon2id$v=19$m=65536,t=1,p=4$%x$%x", salt, key)
+
+	b64Salt := base64.RawStdEncoding.EncodeToString(salt)
+	b64Key := base64.RawStdEncoding.EncodeToString(key)
+	pwHash := fmt.Sprintf("$argon2id$v=19$m=65536,t=1,p=4$%s$%s", b64Salt, b64Key)
 
 	user := domain.User{
 		ID:           "demo",
@@ -605,7 +585,7 @@ func SeedMemoryStore(store Store) {
 		}
 
 		addLog(activities[0], 0.2, 6.4+k/10, 0, 5) // Sleep
-		addLog(activities[1], 8.9, 0, 1, 3)         // Meal
+		addLog(activities[1], 8.9, 0, 1, 3)        // Meal
 		cl := addLog(activities[3], 9.5+k/20, 10.3+k/10, 0, func() float64 {
 			if i == 2 {
 				return 500
@@ -616,12 +596,12 @@ func SeedMemoryStore(store Store) {
 			codingLogID = cl.ID
 			codingLog = cl
 		}
-		addLog(activities[1], 13.2, 0, 1, 6)               // Meal
-		addLog(activities[2], 12.1, 0, 1, 8)               // Prayer
-		addLog(activities[4], 14.5, 15.5+k/5, 0, 7)        // Studying
+		addLog(activities[1], 13.2, 0, 1, 6)                   // Meal
+		addLog(activities[2], 12.1, 0, 1, 8)                   // Prayer
+		addLog(activities[4], 14.5, 15.5+k/5, 0, 7)            // Studying
 		addLog(activities[5], 16.3, 0, 1+float64(int(k)%3), 2) // Smoking
-		addLog(activities[6], 19.7, 20.7+k*0.5, 0, 6)      // Gaming
-		addLog(activities[1], 20.4, 0, 1, 9)               // Meal
+		addLog(activities[6], 19.7, 20.7+k*0.5, 0, 6)          // Gaming
+		addLog(activities[1], 20.4, 0, 1, 9)                   // Meal
 	}
 
 	// Add 1 audit entry for the Coding log
@@ -647,4 +627,3 @@ func SeedMemoryStore(store Store) {
 		_ = store.UpdateLog(codingLog)
 	}
 }
-

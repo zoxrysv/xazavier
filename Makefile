@@ -19,4 +19,4 @@ seed:
 	go run ./cmd/seed
 
 run:
-	go run ./cmd/Server
+	go run ./cmd/server

@@ -46,14 +46,14 @@ type Cluster struct {
 }
 
 type Activity struct {
-	ID          string     `json:"id"`
-	ClusterID   string     `json:"cluster_id"`
-	UserID      string     `json:"user_id"`
-	Name        string     `json:"name"`
-	TrackingType string    `json:"tracking_type"`
-	UnitName    string     `json:"unit_name,omitempty"`
-	DeletedAt   *time.Time `json:"deleted_at,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID           string     `json:"id"`
+	ClusterID    string     `json:"cluster_id"`
+	UserID       string     `json:"user_id"`
+	Name         string     `json:"name"`
+	TrackingType string     `json:"tracking_type"`
+	UnitName     string     `json:"unit_name,omitempty"`
+	DeletedAt    *time.Time `json:"deleted_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
 }
 
 type Log struct {
@@ -137,23 +137,23 @@ type ActivityUpdateRequest struct {
 }
 
 type LogCreateRequest struct {
-	ActivityID string      `json:"activity_id"`
-	StartTime  interface{} `json:"start_time"`
-	EndTime    interface{} `json:"end_time,omitempty"`
+	ActivityID  string      `json:"activity_id"`
+	StartTime   interface{} `json:"start_time"`
+	EndTime     interface{} `json:"end_time,omitempty"`
 	LoggedValue interface{} `json:"logged_value,omitempty"`
-	Notes      string      `json:"notes,omitempty"`
+	Notes       string      `json:"notes,omitempty"`
 }
 
 type LogUpdateRequest struct {
-	EndTime    interface{} `json:"end_time,omitempty"`
+	EndTime     interface{} `json:"end_time,omitempty"`
 	LoggedValue interface{} `json:"logged_value,omitempty"`
-	Notes      string      `json:"notes,omitempty"`
-	StartTime  interface{} `json:"start_time,omitempty"`
+	Notes       string      `json:"notes,omitempty"`
+	StartTime   interface{} `json:"start_time,omitempty"`
 }
 
 type TokenBundle struct {
 	AccessToken  string     `json:"access_token"`
-	RefreshToken string     `json:"refresh_token,omitempty"`
+	RefreshToken string     `json:"-"` // set only as HttpOnly cookie, never in JSON
 	User         UserPublic `json:"user"`
 }
 
@@ -167,4 +167,9 @@ type LogListFilter struct {
 type AuditListFilter struct {
 	Limit  int `json:"limit,omitempty"`
 	Offset int `json:"offset,omitempty"`
+}
+
+// ResetRequest requires explicit confirmation to guard against accidental data loss.
+type ResetRequest struct {
+	Confirm bool `json:"confirm"` // must be true
 }

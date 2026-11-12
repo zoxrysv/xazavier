@@ -55,7 +55,6 @@ CREATE TABLE IF NOT EXISTS logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     edited INTEGER NOT NULL DEFAULT 0 CHECK (edited >= 0),
-    CHECK (start_time <= NOW() + INTERVAL '5 minutes'),
     CHECK (logged_value IS NULL OR logged_value >= 0),
     CHECK (end_time IS NULL OR end_time >= start_time)
 );
