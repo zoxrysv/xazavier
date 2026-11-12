@@ -1,0 +1,13 @@
+# Logs
+logs
+*.log
+*.zip
+*.tar.gz
+*.exe
+
+# Environment & credentials
+.env
+.env*.local
+*.env
+*.pem
+*.key
