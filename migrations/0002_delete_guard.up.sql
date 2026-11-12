@@ -1,0 +1,15 @@
+CREATE OR REPLACE FUNCTION guard_delete_log()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.start_time < NOW() - INTERVAL '24 hours' THEN
+        RAISE EXCEPTION 'LOCKED_LOG' USING ERRCODE = 'P0001';
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS logs_delete_guard ON logs;
+CREATE TRIGGER logs_delete_guard
+BEFORE DELETE ON logs
+FOR EACH ROW
+EXECUTE FUNCTION guard_delete_log();

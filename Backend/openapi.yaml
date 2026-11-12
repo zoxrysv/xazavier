@@ -1,0 +1,538 @@
+openapi: 3.0.3
+info:
+  title: Xazavier API
+  description: Personal activity ledger API enforcing strict time and history integrity rules.
+  version: 1.0.0
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /readyz:
+    get:
+      summary: Readiness check
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+
+  /api/auth/register:
+    post:
+      summary: Register a new user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, full_name]
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+                full_name:
+                  type: string
+                timezone:
+                  type: string
+                  example: Asia/Jakarta
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenBundle'
+
+  /api/auth/login:
+    post:
+      summary: Login user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenBundle'
+
+  /api/auth/refresh:
+    post:
+      summary: Refresh access token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenBundle'
+
+  /api/auth/logout:
+    post:
+      summary: Revoke session and log out
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token:
+                  type: string
+      responses:
+        '200':
+          description: Success
+
+  /api/me:
+    get:
+      summary: Current user profile
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPublic'
+
+  /api/clusters:
+    get:
+      summary: List clusters
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Clusters list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Cluster'
+    post:
+      summary: Create cluster
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                icon:
+                  type: string
+                color:
+                  type: string
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Cluster'
+
+  /api/clusters/{id}:
+    put:
+      summary: Update cluster
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                archived:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated cluster
+    delete:
+      summary: Delete cluster
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+
+  /api/activities:
+    get:
+      summary: List activities
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Activities list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Activity'
+    post:
+      summary: Create activity
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cluster_id, name, tracking_type]
+              properties:
+                cluster_id:
+                  type: string
+                name:
+                  type: string
+                tracking_type:
+                  type: string
+                  enum: [duration, count]
+                unit_name:
+                  type: string
+      responses:
+        '201':
+          description: Created activity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Activity'
+
+  /api/activities/{id}:
+    put:
+      summary: Update activity
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                unit_name:
+                  type: string
+                archived:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated activity
+    delete:
+      summary: Delete activity
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+
+  /api/logs:
+    get:
+      summary: List activity logs
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Logs list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Log'
+    post:
+      summary: Record activity log
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [activity_id, start_time]
+              properties:
+                activity_id:
+                  type: string
+                start_time:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                end_time:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                logged_value:
+                  type: number
+                notes:
+                  type: string
+      responses:
+        '201':
+          description: Recorded log
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Log'
+
+  /api/logs/{id}:
+    get:
+      summary: Get log details
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Log item
+    put:
+      summary: Edit log record
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                end_time:
+                  oneOf:
+                    - type: string
+                    - type: integer
+                logged_value:
+                  type: number
+                notes:
+                  type: string
+      responses:
+        '200':
+          description: Updated log
+    delete:
+      summary: Delete log record
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+
+  /api/logs/{id}/audit:
+    get:
+      summary: Get audit history for specific log
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Audit list for log
+
+  /api/audit:
+    get:
+      summary: Get all audit entries for current user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: All user audit records
+
+  /api/reset:
+    post:
+      summary: Reset user activity data
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Reset confirmation
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    UserPublic:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        full_name:
+          type: string
+        timezone:
+          type: string
+
+    TokenBundle:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        user:
+          $ref: '#/components/schemas/UserPublic'
+
+    Cluster:
+      type: object
+      properties:
+        id:
+          type: string
+        user_id:
+          type: string
+        name:
+          type: string
+        icon:
+          type: string
+        color:
+          type: string
+        deleted_at:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+
+    Activity:
+      type: object
+      properties:
+        id:
+          type: string
+        cluster_id:
+          type: string
+        user_id:
+          type: string
+        name:
+          type: string
+        tracking_type:
+          type: string
+        unit_name:
+          type: string
+        deleted_at:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+
+    Log:
+      type: object
+      properties:
+        id:
+          type: string
+        activity_id:
+          type: string
+        user_id:
+          type: string
+        log_date:
+          type: string
+        start_time:
+          type: string
+        end_time:
+          type: string
+          nullable: true
+        logged_value:
+          type: number
+          nullable: true
+        entry_status:
+          type: string
+          enum: [NORMAL, LATE]
+        status:
+          type: string
+          enum: [normal, late]
+        notes:
+          type: string
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        edited:
+          type: integer
