@@ -48,12 +48,21 @@ func (s *Service) ValidateSession(sessionID string) (domain.User, bool) {
 }
 
 func (s *Service) Register(ctx context.Context, req domain.AuthRegisterRequest, ip string) (domain.TokenBundle, error) {
-	if req.FullName == "" || len(req.Password) < 8 || req.Email == "" {
+	if strings.TrimSpace(req.FullName) == "" || len(req.Password) < 8 || strings.TrimSpace(req.Email) == "" {
 		return domain.TokenBundle{}, apperr.InvalidRequest("Name, email and a password of at least 8 characters are required.")
 	}
+	if len(req.Password) > 72 {
+		return domain.TokenBundle{}, apperr.InvalidRequest("Password cannot exceed 72 characters.")
+	}
 	email := auth.NormalizeEmail(req.Email)
+	if !auth.IsValidEmail(email) {
+		return domain.TokenBundle{}, apperr.InvalidRequest("A valid email address is required.")
+	}
 	if req.Timezone == "" {
 		req.Timezone = "Asia/Jakarta"
+	}
+	if _, err := time.LoadLocation(req.Timezone); err != nil {
+		return domain.TokenBundle{}, apperr.InvalidRequest(fmt.Sprintf("Invalid timezone: %s. Please provide a valid IANA timezone.", req.Timezone))
 	}
 	if _, ok := s.store.GetUserByEmail(email); ok {
 		return domain.TokenBundle{}, apperr.Conflict("Registration rejected", "This email address is already registered.")
@@ -62,7 +71,7 @@ func (s *Service) Register(ctx context.Context, req domain.AuthRegisterRequest, 
 	if err != nil {
 		return domain.TokenBundle{}, apperr.InvalidRequest("Password could not be processed.")
 	}
-	user := domain.User{ID: uuid.NewString(), Email: email, PasswordHash: passwordHash, FullName: req.FullName, Timezone: req.Timezone, CreatedAt: time.Now().UTC()}
+	user := domain.User{ID: uuid.NewString(), Email: email, PasswordHash: passwordHash, FullName: strings.TrimSpace(req.FullName), Timezone: req.Timezone, CreatedAt: time.Now().UTC()}
 	if err := s.store.CreateUser(user); err != nil {
 		return domain.TokenBundle{}, apperr.Conflict("Registration rejected", "This email address is already registered.")
 	}
@@ -94,11 +103,30 @@ func (s *Service) Refresh(ctx context.Context, req domain.AuthRefreshRequest, ip
 	if !ok {
 		return domain.TokenBundle{}, apperr.NotFound()
 	}
-	access, err := auth.GenerateAccessToken(user.ID, session.ID, s.cfg.JWTSecret, s.cfg.AccessTokenTTL)
+
+	// Rotate refresh token on each use
+	s.store.RevokeSessionByRefreshTokenHash(hash)
+	newRefresh := auth.GenerateRefreshToken()
+	newSessionID := uuid.NewString()
+	newSession := domain.Session{
+		ID:               newSessionID,
+		UserID:           user.ID,
+		RefreshTokenHash: auth.HashRefreshToken(newRefresh),
+		UserAgent:        session.UserAgent,
+		IPAddress:        ip,
+		IsRevoked:        false,
+		ExpiresAt:        time.Now().Add(s.cfg.RefreshTokenTTL),
+		CreatedAt:        time.Now().UTC(),
+	}
+	if err := s.store.AddSession(newSession); err != nil {
+		return domain.TokenBundle{}, err
+	}
+
+	access, err := auth.GenerateAccessToken(user.ID, newSessionID, s.cfg.JWTSecret, s.cfg.AccessTokenTTL)
 	if err != nil {
 		return domain.TokenBundle{}, apperr.InternalServerError()
 	}
-	return domain.TokenBundle{AccessToken: access, User: user.Public()}, nil
+	return domain.TokenBundle{AccessToken: access, RefreshToken: newRefresh, User: user.Public()}, nil
 }
 
 func (s *Service) Logout(ctx context.Context, req domain.AuthLogoutRequest) error {
@@ -228,6 +256,10 @@ func (s *Service) UpdateActivity(ctx context.Context, id string, req domain.Acti
 		activity.Name = strings.TrimSpace(req.Name)
 	}
 	if req.ClusterID != "" {
+		cluster, ok := s.store.GetClusterByID(user.ID, req.ClusterID)
+		if !ok || cluster.DeletedAt != nil {
+			return domain.Activity{}, apperr.UnprocessableEntity("Activity update rejected", "The selected cluster does not exist or is archived.", "CLUSTER_INVALID")
+		}
 		activity.ClusterID = req.ClusterID
 	}
 	if req.UnitName != "" {

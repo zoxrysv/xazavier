@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strings"
 
 	"xazavier/internal/config"
 	"xazavier/internal/httpapi"
@@ -17,8 +18,19 @@ func main() {
 	}
 
 	var store repository.Store
-	if cfg.DatabaseURL == "memory" || cfg.DatabaseURL == "" {
-		log.Println("DATABASE_URL set to 'memory' (or empty): running with in-memory store & demo dataset")
+	if cfg.DatabaseURL == "memory" {
+		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "prod") {
+			log.Fatal("DATABASE_URL='memory' is not allowed in production environment")
+		}
+		log.Println("DATABASE_URL set to 'memory': running with in-memory store & demo dataset")
+		memStore := repository.NewMemoryStore()
+		repository.SeedMemoryStore(memStore)
+		store = memStore
+	} else if strings.TrimSpace(cfg.DatabaseURL) == "" {
+		if strings.EqualFold(cfg.Env, "production") || strings.EqualFold(cfg.Env, "prod") {
+			log.Fatal("DATABASE_URL is empty in production: a valid PostgreSQL connection string is required")
+		}
+		log.Println("DATABASE_URL is empty: falling back to in-memory store & demo dataset (dev mode only)")
 		memStore := repository.NewMemoryStore()
 		repository.SeedMemoryStore(memStore)
 		store = memStore

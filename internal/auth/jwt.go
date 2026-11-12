@@ -93,3 +93,18 @@ func GenerateRefreshToken() string {
 func NormalizeEmail(v string) string {
     return strings.TrimSpace(strings.ToLower(v))
 }
+
+func IsValidEmail(email string) bool {
+    if len(email) < 3 || len(email) > 254 {
+        return false
+    }
+    at := strings.Index(email, "@")
+    if at <= 0 || at >= len(email)-1 {
+        return false
+    }
+    dot := strings.LastIndex(email, ".")
+    if dot <= at+1 || dot >= len(email)-1 {
+        return false
+    }
+    return !strings.ContainsAny(email, " \t\r\n")
+}

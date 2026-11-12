@@ -9,6 +9,7 @@ import (
 )
 
 type Config struct {
+	Env                 string
 	Port                string
 	DatabaseURL         string
 	JWTSecret           string
@@ -24,12 +25,13 @@ type Config struct {
 func Load() Config {
 	_ = godotenv.Load()
 	cfg := Config{
+		Env:             env("APP_ENV", env("ENV", "development")),
 		Port:            env("PORT", "8080"),
 		DatabaseURL:     env("DATABASE_URL", ""),
 		JWTSecret:       env("JWT_SECRET", ""),
 		AccessTokenTTL:  parseDuration(env("ACCESS_TOKEN_TTL", "15m"), 15*time.Minute),
 		RefreshTokenTTL: parseDuration(env("REFRESH_TOKEN_TTL", "720h"), 30*24*time.Hour),
-		CORSAllowedOrigins: splitCSV(env("CORS_ALLOWED_ORIGINS", "*")),
+		CORSAllowedOrigins: splitCSV(env("CORS_ALLOWED_ORIGINS", "")),
 		AutoMigrate:     envBool("AUTO_MIGRATE", true),
 		LogLevel:        env("LOG_LEVEL", "info"),
 		TrustedProxy:    env("TRUSTED_PROXY", ""),

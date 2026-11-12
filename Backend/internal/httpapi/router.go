@@ -6,6 +6,7 @@ import (
     "errors"
     "fmt"
     "log/slog"
+    "net"
     "net/http"
     "strconv"
     "strings"
@@ -40,40 +41,40 @@ func NewServer(cfg config.Config, store repository.Store) http.Handler {
     r.Use(middleware.Recoverer)
     r.Use(middleware.Logger)
     r.Use(middleware.Timeout(30 * time.Second))
-    r.Use(corsMiddleware)
+    r.Use(corsMiddleware(cfg))
 
-    limiter := newRateLimiter(10, time.Minute)
+    authLimiter := newRateLimiter(10, time.Minute)
 
     r.Route(apiPrefix, func(r chi.Router) {
-        r.Post("/auth/register", limit(limiter, func(w http.ResponseWriter, r *http.Request) {
+        r.Post("/auth/register", limit(authLimiter, cfg, func(w http.ResponseWriter, r *http.Request) {
             var body domain.AuthRegisterRequest
             if err := decodeJSON(r, &body); err != nil { writeError(w, err); return }
-            bundle, err := svc.Register(r.Context(), body, clientIP(r))
+            bundle, err := svc.Register(r.Context(), body, clientIP(r, cfg))
             if err != nil { writeError(w, err); return }
             setRefreshTokenCookie(w, bundle.RefreshToken, cfg)
             writeJSON(w, http.StatusCreated, bundle)
         }))
-        r.Post("/auth/login", limit(limiter, func(w http.ResponseWriter, r *http.Request) {
+        r.Post("/auth/login", limit(authLimiter, cfg, func(w http.ResponseWriter, r *http.Request) {
             var body domain.AuthLoginRequest
             if err := decodeJSON(r, &body); err != nil { writeError(w, err); return }
-            bundle, err := svc.Login(r.Context(), body, clientIP(r))
+            bundle, err := svc.Login(r.Context(), body, clientIP(r, cfg))
             if err != nil { writeError(w, err); return }
             setRefreshTokenCookie(w, bundle.RefreshToken, cfg)
             writeJSON(w, http.StatusOK, bundle)
         }))
-        r.Post("/auth/refresh", func(w http.ResponseWriter, r *http.Request) {
+        r.Post("/auth/refresh", limit(authLimiter, cfg, func(w http.ResponseWriter, r *http.Request) {
             var body domain.AuthRefreshRequest
             _ = decodeJSON(r, &body)
             if cookie, err := r.Cookie("refresh_token"); err == nil && cookie.Value != "" {
                 body.RefreshToken = cookie.Value
             }
-            bundle, err := svc.Refresh(r.Context(), body, clientIP(r))
+            bundle, err := svc.Refresh(r.Context(), body, clientIP(r, cfg))
             if err != nil { writeError(w, err); return }
             if bundle.RefreshToken != "" {
                 setRefreshTokenCookie(w, bundle.RefreshToken, cfg)
             }
             writeJSON(w, http.StatusOK, bundle)
-        })
+        }))
         r.Post("/auth/logout", func(w http.ResponseWriter, r *http.Request) {
             var body domain.AuthLogoutRequest
             _ = decodeJSON(r, &body)
@@ -210,24 +211,47 @@ func NewServer(cfg config.Config, store repository.Store) http.Handler {
     return r
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.Header().Set("X-Content-Type-Options", "nosniff")
-        w.Header().Set("Cache-Control", "no-store")
-        origin := r.Header.Get("Origin")
-        if origin != "" {
-            w.Header().Set("Access-Control-Allow-Origin", origin)
-            w.Header().Set("Access-Control-Allow-Credentials", "true")
-            w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-            w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+func corsMiddleware(cfg config.Config) func(http.Handler) http.Handler {
+    allowedOrigins := make(map[string]bool)
+    allowAll := false
+    for _, o := range cfg.CORSAllowedOrigins {
+        trimmed := strings.TrimSpace(o)
+        if trimmed == "*" {
+            allowAll = true
+        } else if trimmed != "" {
+            allowedOrigins[strings.ToLower(trimmed)] = true
         }
-        if r.Method == http.MethodOptions {
-            w.WriteHeader(http.StatusNoContent)
-            return
-        }
-        next.ServeHTTP(w, r)
-    })
+    }
+    // If empty in dev, allow localhost defaults
+    if len(allowedOrigins) == 0 && !allowAll {
+        allowedOrigins["http://localhost:5173"] = true
+        allowedOrigins["http://localhost:3000"] = true
+        allowedOrigins["http://127.0.0.1:5173"] = true
+        allowedOrigins["http://127.0.0.1:3000"] = true
+    }
+
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            w.Header().Set("Content-Type", "application/json")
+            w.Header().Set("X-Content-Type-Options", "nosniff")
+            w.Header().Set("Cache-Control", "no-store")
+            origin := r.Header.Get("Origin")
+            if origin != "" {
+                isAllowed := allowAll || allowedOrigins[strings.ToLower(origin)]
+                if isAllowed {
+                    w.Header().Set("Access-Control-Allow-Origin", origin)
+                    w.Header().Set("Access-Control-Allow-Credentials", "true")
+                    w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+                    w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+                }
+            }
+            if r.Method == http.MethodOptions {
+                w.WriteHeader(http.StatusNoContent)
+                return
+            }
+            next.ServeHTTP(w, r)
+        })
+    }
 }
 
 func requireAuth(s *service.Service) func(http.Handler) http.Handler {
@@ -260,7 +284,13 @@ func decodeJSON(r *http.Request, v any) error {
         return apperr.InvalidRequest("Request body is required.")
     }
     defer r.Body.Close()
+    // Limit body size to 1MB to prevent memory exhaustion attacks
+    r.Body = http.MaxBytesReader(nil, r.Body, 1024*1024)
     if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+        var maxBytesErr *http.MaxBytesError
+        if errors.As(err, &maxBytesErr) {
+            return apperr.InvalidRequest("Request body exceeds maximum size of 1MB.")
+        }
         return apperr.InvalidRequest("Malformed JSON request.")
     }
     return nil
@@ -323,11 +353,31 @@ func writeError(w http.ResponseWriter, err error) {
     })
 }
 
-func clientIP(r *http.Request) string {
-    if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-        return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+func clientIP(r *http.Request, cfg config.Config) string {
+    trustedProxy := strings.TrimSpace(cfg.TrustedProxy)
+    remoteHost := strings.TrimSpace(r.RemoteAddr)
+    if host, _, err := net.SplitHostPort(remoteHost); err == nil {
+        remoteHost = host
     }
-    return strings.TrimSpace(r.RemoteAddr)
+
+    // Only trust X-Forwarded-For if TRUSTED_PROXY is configured and matches remote host or CIDR
+    if trustedProxy != "" {
+        isTrusted := false
+        if _, cidrNet, err := net.ParseCIDR(trustedProxy); err == nil {
+            if ip := net.ParseIP(remoteHost); ip != nil && cidrNet.Contains(ip) {
+                isTrusted = true
+            }
+        } else if strings.EqualFold(remoteHost, trustedProxy) {
+            isTrusted = true
+        }
+
+        if isTrusted {
+            if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+                return strings.TrimSpace(strings.Split(forwarded, ",")[0])
+            }
+        }
+    }
+    return remoteHost
 }
 
 type tokenBucket struct {
@@ -338,7 +388,31 @@ type tokenBucket struct {
 }
 
 func newRateLimiter(limit int, window time.Duration) *tokenBucket {
-    return &tokenBucket{limit: limit, window: window, data: make(map[string][]time.Time)}
+    tb := &tokenBucket{limit: limit, window: window, data: make(map[string][]time.Time)}
+    // Periodically clean up old IP entries to prevent memory leak
+    go func() {
+        ticker := time.NewTicker(window * 2)
+        defer ticker.Stop()
+        for range ticker.C {
+            tb.mu.Lock()
+            now := time.Now()
+            for ip, bucket := range tb.data {
+                filtered := bucket[:0]
+                for _, ts := range bucket {
+                    if now.Sub(ts) < tb.window {
+                        filtered = append(filtered, ts)
+                    }
+                }
+                if len(filtered) == 0 {
+                    delete(tb.data, ip)
+                } else {
+                    tb.data[ip] = filtered
+                }
+            }
+            tb.mu.Unlock()
+        }
+    }()
+    return tb
 }
 
 func (b *tokenBucket) Allow(ip string) bool {
@@ -360,9 +434,9 @@ func (b *tokenBucket) Allow(ip string) bool {
     return true
 }
 
-func limit(l *tokenBucket, next http.HandlerFunc) http.HandlerFunc {
+func limit(l *tokenBucket, cfg config.Config, next http.HandlerFunc) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
-        if !l.Allow(clientIP(r)) {
+        if !l.Allow(clientIP(r, cfg)) {
             writeError(w, apperr.TooManyRequests())
             return
         }
